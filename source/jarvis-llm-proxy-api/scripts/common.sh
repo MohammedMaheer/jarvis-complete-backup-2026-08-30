@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+# Common functions and setup for run scripts
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+NC='\033[0m' # No Color
+
+# Get script root directory (parent of scripts directory)
+get_root_dir() {
+    local script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[1]}")" >/dev/null 2>&1 && pwd)"
+    # If we're in the scripts directory, go up one level
+    if [[ "$(basename "$script_dir")" == "scripts" ]]; then
+        dirname "$script_dir"
+    else
+        echo "$script_dir"
+    fi
+}
+
+# Initialize common variables
+init_common_vars() {
+    ROOT="${ROOT:-$(get_root_dir)}"
+    cd "$ROOT"
+    
+    PYTHON_VERSION="${PYTHON_VERSION:-3.11.9}"
+    VENV="$ROOT/.venv"
+    PY="$VENV/bin/python"
+    PIP="$VENV/bin/pip"
+    SETUP_CONFIG="$ROOT/.setup_config"
+}
+
+# Check and run setup if needed
+check_setup() {
+    if [[ ! -f "$SETUP_CONFIG" ]]; then
+        echo -e "${YELLOW}⚠️  Setup configuration not found. Running setup first...${NC}"
+        if [[ "${AUTO_SETUP:-}" == "true" ]]; then
+            ./setup.sh --auto
+        else
+            ./setup.sh
+        fi
+    fi
+
+    # Load setup configuration
+    source "$SETUP_CONFIG"
+    echo -e "${GREEN}🔧 Using configuration: OS=$OS, Acceleration=$ACCELERATION${NC}"
+}
+
+# Create virtual environment (different strategies for dev vs prod)
+create_venv_dev() {
+    # Development: try pyenv first, fallback to system python
+    BASE_PY=""
+    if command -v pyenv >/dev/null 2>&1; then
+        # install if missing, but non-interactively (-s = skip if already installed)
+        PYENV_NONINTERACTIVE=1 pyenv install -s "$PYTHON_VERSION"
+        BASE_PY="$(pyenv prefix "$PYTHON_VERSION")/bin/python"
+    fi
+    if [[ -z "${BASE_PY}" ]]; then
+        # fallback to system/Homebrew python3
+        BASE_PY="$(command -v python3)"
+    fi
+    if [[ -z "${BASE_PY}" ]]; then
+        echo "❌ No usable python found (neither pyenv nor python3)."; exit 1
+    fi
+    
+    # Create venv if missing
+    if [[ ! -x "$PY" ]]; then
+        echo "📦 Creating virtual environment with $BASE_PY"
+        "$BASE_PY" -m venv "$VENV"
+    fi
+}
+
+create_venv_prod() {
+    # Production: create the venv with a Python >=3.11. macOS system python3 is
+    # usually 3.9, and `brew install python@3.11` provides `python3.11` — NOT a
+    # bare `python3` — so prefer explicitly-versioned interpreters and only
+    # accept `python3` when it is new enough. Fail loudly instead of building a
+    # 3.9 venv that pip then rejects dependency-by-dependency.
+    if [[ ! -d "$VENV" ]]; then
+        local BASE_PY="" _cand
+        for _cand in python3.13 python3.12 python3.11; do
+            if command -v "$_cand" >/dev/null 2>&1; then BASE_PY="$_cand"; break; fi
+        done
+        if [[ -z "$BASE_PY" ]] && command -v python3 >/dev/null 2>&1 \
+            && python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+            BASE_PY="python3"
+        fi
+        if [[ -z "$BASE_PY" ]]; then
+            echo -e "${RED}❌ Python >=3.11 is required but was not found.${NC}" >&2
+            echo -e "${RED}   Install it (e.g. 'brew install python@3.11') and retry.${NC}" >&2
+            exit 1
+        fi
+        echo -e "${BLUE}📦 Creating virtual environment with $BASE_PY ($("$BASE_PY" --version 2>&1))...${NC}"
+        "$BASE_PY" -m venv "$VENV"
+        echo -e "${GREEN}✅ Virtual environment created${NC}"
+    fi
+    
+    # Verify Python executable
+    if [[ ! -x "$PY" ]]; then
+        echo -e "${RED}❌ Python executable not found at $PY${NC}"
+        exit 1
+    fi
+}
+
+# Load environment variables
+load_env() {
+    local env_file="${1:-.env}"
+    
+    # Load environment variables early for dependency detection
+    if [[ -f "$env_file" ]]; then
+        echo -e "${BLUE}📄 Loading environment from $env_file${NC}"
+        set -a  # automatically export all variables
+        source "$env_file"
+        set +a
+    else
+        echo -e "${YELLOW}⚠️  Environment file $env_file not found, using defaults${NC}"
+    fi
+}
+
+# Configure runtime environment for vLLM
+configure_vllm_env() {
+    local using_vllm=false
+    if [[ "${JARVIS_INFERENCE_ENGINE:-}" == "vllm" ]] || [[ "${JARVIS_MODEL_BACKEND:-}" == "VLLM" ]] || [[ "${JARVIS_LIGHTWEIGHT_MODEL_BACKEND:-}" == "VLLM" ]]; then
+        using_vllm=true
+    fi
+    if [[ "$using_vllm" == "true" ]]; then
+        export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
+    fi
+}
+
+# Map jarvis package names to local directory names
+_jarvis_local_dir() {
+    local pkg="$1"
+    case "$pkg" in
+        jarvis-config-client)  echo "jarvis-config-client" ;;
+        jarvis-settings-client) echo "jarvis-settings-client" ;;
+        jarvis-auth-client)    echo "jarvis-auth-client" ;;
+        jarvis-log-client)     echo "jarvis-log-client" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Install base requirements
+# If USE_LOCAL_LIBS=true, jarvis-*-client packages are installed as editable
+# from sibling directories instead of being pulled from GitHub.
+install_base_requirements() {
+    echo -e "${BLUE}📦 Installing base requirements${NC}"
+    "$PIP" install -U pip setuptools
+
+    if [[ "${USE_LOCAL_LIBS:-false}" == "true" ]]; then
+        echo -e "${PURPLE}🏠 --local mode: jarvis libraries will be installed from local directories${NC}"
+        local workspace
+        workspace="$(dirname "$ROOT")"
+
+        # Build a filtered requirements file (skip jarvis-*-client git lines)
+        local tmpfile
+        tmpfile="$(mktemp)"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Match lines like: jarvis-foo-client @ git+https://...
+            if [[ "$line" =~ ^(jarvis-[a-z]+-client)[[:space:]]*@[[:space:]]*git\+ ]]; then
+                local pkg="${BASH_REMATCH[1]}"
+                local dir_name
+                dir_name="$(_jarvis_local_dir "$pkg")"
+                local local_path="${workspace}/${dir_name}"
+                if [[ -n "$dir_name" && -d "$local_path" ]]; then
+                    echo -e "${PURPLE}   📁 ${pkg} → ${local_path}${NC}"
+                    "$PIP" install -e "$local_path" 2>&1 | tail -1
+                else
+                    echo -e "${YELLOW}   ⚠️  Local dir not found for ${pkg} (${local_path}), falling back to git${NC}"
+                    echo "$line" >> "$tmpfile"
+                fi
+            else
+                echo "$line" >> "$tmpfile"
+            fi
+        done < requirements-base.txt
+
+        # Install remaining (non-jarvis) requirements
+        "$PIP" install --upgrade -r "$tmpfile"
+        rm -f "$tmpfile"
+    else
+        # Default: install everything from requirements (including git-sourced packages)
+        # --upgrade ensures git-sourced packages are re-installed when the remote
+        # branch has new commits at the same version number.
+        "$PIP" install --upgrade -r requirements-base.txt
+    fi
+}
+
+# Check if llama-cpp-python needs to be installed/updated
+should_install_llama_cpp() {
+    local acceleration_type="$1"
+    
+    # Check if llama-cpp-python is installed
+    if ! "$PIP" show llama-cpp-python >/dev/null 2>&1; then
+        echo "true"  # Not installed
+        return
+    fi
+    
+    # Check if it was built with the correct acceleration
+    local current_info
+    current_info=$("$PY" -c "
+try:
+    import llama_cpp
+    print('installed')
+    # Try to detect build configuration
+    try:
+        # This will fail if not built with CUDA
+        if hasattr(llama_cpp.llama_cpp, 'GGML_USE_CUDA'):
+            print('cuda')
+        elif hasattr(llama_cpp.llama_cpp, 'GGML_USE_METAL'):
+            print('metal')
+        elif hasattr(llama_cpp.llama_cpp, 'GGML_USE_HIP') or hasattr(llama_cpp.llama_cpp, 'GGML_USE_HIPBLAS'):
+            print('rocm')
+        elif hasattr(llama_cpp.llama_cpp, 'GGML_USE_VULKAN'):
+            print('vulkan')
+        else:
+            print('cpu')
+    except:
+        print('unknown')
+except ImportError:
+    print('not_installed')
+" 2>/dev/null || echo "not_installed")
+    
+    echo -e "${BLUE}🔍 llama-cpp-python build info: ${current_info//$'\n'/, }${NC}"
+    echo -e "${BLUE}🔍 Expected acceleration: ${acceleration_type}${NC}"
+    if [[ "$current_info" == *"$acceleration_type"* ]]; then
+        echo "false"  # Already installed with correct acceleration
+    else
+        echo "true"   # Needs reinstall
+    fi
+}
+
+# Install llama-cpp-python with appropriate acceleration
+install_llama_cpp() {
+    local acceleration_type="$1"
+    local cmake_args=""
+    
+    case "$acceleration_type" in
+        "cuda")
+            cmake_args="-DGGML_CUDA=on"
+            ;;
+        "metal")
+            cmake_args="-DGGML_METAL=on"
+            ;;
+        "rocm")
+            # GGML_HIP is the current flag; the old GGML_HIPBLAS is silently
+            # ignored by CMake -> CPU-only build. Point CMake at the HIP compiler.
+            cmake_args="-DGGML_HIP=on"
+            export HIPCXX="${ROCM_PATH:-/opt/rocm}/llvm/bin/clang"
+            export HIP_PATH="${ROCM_PATH:-/opt/rocm}"
+            ;;
+        "vulkan")
+            cmake_args="-DGGML_VULKAN=on"
+            ;;
+        "cpu"|*)
+            cmake_args=""
+            ;;
+    esac
+    
+    echo -e "${YELLOW}🔄 Installing/updating llama-cpp-python for $acceleration_type acceleration...${NC}"
+    "$PIP" uninstall -y llama-cpp-python || true
+    
+    # Set GCC 10 for CUDA compatibility (Ubuntu CUDA + GCC 11 issue)
+    if [[ "$acceleration_type" == "cuda" ]]; then
+        if ! command -v gcc-10 >/dev/null 2>&1; then
+            echo -e "${RED}❌ GCC 10 not found. Installing...${NC}"
+            sudo apt update && sudo apt install -y gcc-10 g++-10
+        fi
+        
+        export CC=gcc-10
+        export CXX=g++-10
+        export CUDAHOSTCXX=g++-10
+        gcc_env="CC=gcc-10 CXX=g++-10 CUDAHOSTCXX=g++-10"
+    else
+        gcc_env=""
+    fi
+    
+    if [[ -n "$cmake_args" ]]; then
+        echo -e "${BLUE}Building llama-cpp-python with: $cmake_args${NC}"
+        if [[ -n "$gcc_env" ]]; then
+            echo -e "${YELLOW}Using GCC 10 for CUDA compatibility${NC}"
+            env $gcc_env CMAKE_ARGS="$cmake_args" "$PIP" install --no-cache-dir llama-cpp-python
+        else
+            CMAKE_ARGS="$cmake_args" "$PIP" install --no-cache-dir llama-cpp-python
+        fi
+    else
+        echo -e "${BLUE}Installing llama-cpp-python (CPU-only)${NC}"
+        "$PIP" install llama-cpp-python
+    fi
+}
+
+# Check if llama-cpp-python is needed based on backend configuration
+needs_llama_cpp() {
+    # llama-cpp-python is needed for:
+    # 1. GGUF backend (always)
+    # 2. Explicit llama_cpp inference engine
+    # 3. No backend configured (GGUF is the runtime default)
+    local main_backend="${JARVIS_MODEL_BACKEND:-}"
+    local lightweight_backend="${JARVIS_LIGHTWEIGHT_MODEL_BACKEND:-}"
+    local engine="${JARVIS_INFERENCE_ENGINE:-}"
+
+    # Explicitly needed
+    if [[ "$main_backend" == "GGUF" ]] || [[ "$lightweight_backend" == "GGUF" ]] || [[ "$engine" == "llama_cpp" ]]; then
+        echo "true"
+        return
+    fi
+
+    # Explicitly NOT needed (non-GGUF backend configured)
+    if [[ -n "$main_backend" ]] || [[ -n "$engine" ]]; then
+        echo "false"
+        return
+    fi
+
+    # No backend configured — default to true (GGUF is the runtime default)
+    echo "true"
+}
+
+# Install conditional requirements based on environment variables
+install_conditional_requirements() {
+    # Check if we need transformers backend
+    if [[ "${JARVIS_MODEL_BACKEND:-}" == "TRANSFORMERS" ]] || [[ "${JARVIS_LIGHTWEIGHT_MODEL_BACKEND:-}" == "TRANSFORMERS" ]]; then
+        echo -e "${BLUE}📦 Installing Transformers backend requirements${NC}"
+        "$PIP" install -r requirements-transformers.txt
+    fi
+    
+    # Check if we need vLLM
+    if [[ "${JARVIS_INFERENCE_ENGINE:-}" == "vllm" ]]; then
+        if "$PIP" show vllm >/dev/null 2>&1 && [[ "${FORCE_VLLM_REINSTALL:-}" != "true" ]]; then
+            echo -e "${YELLOW}⏭️  vLLM already installed; skipping requirements-vllm.txt (set FORCE_VLLM_REINSTALL=true to reinstall)${NC}"
+        else
+            echo -e "${BLUE}📦 Installing vLLM requirements${NC}"
+            "$PIP" install -r requirements-vllm.txt
+        fi
+    fi
+}
+
+# Install acceleration-specific requirements
+install_acceleration_requirements() {
+    local acceleration="$1"
+    local should_install="$2"
+    
+    case "$acceleration" in
+        "cuda")
+            echo -e "${GREEN}Installing CUDA-accelerated llama-cpp-python...${NC}"
+            if [[ "$should_install" == "true" ]]; then
+                install_llama_cpp "cuda"
+            else
+                echo -e "${GREEN}✅ CUDA llama-cpp-python already installed${NC}"
+            fi
+            ;;
+        "metal")
+            echo -e "${GREEN}Installing Metal-accelerated requirements...${NC}"
+            "$PIP" install -r requirements-metal.txt
+            if [[ "$should_install" == "true" ]]; then
+                install_llama_cpp "metal"
+            else
+                echo -e "${GREEN}✅ Metal llama-cpp-python already installed${NC}"
+            fi
+            ;;
+        "rocm")
+            echo -e "${GREEN}Installing ROCm-accelerated llama-cpp-python...${NC}"
+            if [[ "$should_install" == "true" ]]; then
+                install_llama_cpp "rocm"
+            else
+                echo -e "${GREEN}✅ ROCm llama-cpp-python already installed${NC}"
+            fi
+            ;;
+        "cpu"|*)
+            echo -e "${GREEN}Installing CPU-only llama-cpp-python...${NC}"
+            if [[ "$should_install" == "true" ]]; then
+                install_llama_cpp "cpu"
+            else
+                echo -e "${GREEN}✅ CPU llama-cpp-python already installed${NC}"
+            fi
+            ;;
+    esac
+}
+
+# Run diagnostics
+run_diagnostics() {
+    # Only run llama.cpp diagnostics if llama-cpp-python is needed
+    if [[ "$(needs_llama_cpp)" == "true" ]]; then
+        echo -e "${BLUE}🔍 Running llama-cpp-python diagnostics...${NC}"
+        "$PY" -c "
+import llama_cpp
+print(f'✅ llama-cpp-python version: {llama_cpp.__version__}')
+try:
+    # Test basic functionality
+    print('🔍 Testing llama-cpp-python import and basic functionality...')
+    print('✅ llama-cpp-python is working correctly')
+except Exception as e:
+    print(f'❌ llama-cpp-python test failed: {e}')
+"
+    else
+        echo -e "${YELLOW}⏭️  Skipping llama-cpp-python diagnostics (not needed for current backends)${NC}"
+    fi
+}
+
+# PID file location
+PID_FILE="${ROOT:-.}/.llm-proxy.pids"
+
+# Write PID to file for tracking
+write_pid() {
+    local name="$1"
+    local pid="$2"
+    echo "${name}=${pid}" >> "$PID_FILE"
+}
+
+# Read PIDs from file
+read_pids() {
+    if [[ -f "$PID_FILE" ]]; then
+        cat "$PID_FILE"
+    fi
+}
+
+# Kill process and its children by PID
+kill_tree() {
+    local pid="$1"
+    local signal="${2:-TERM}"
+
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    # Get all children first
+    local children
+    children=$(pgrep -P "$pid" 2>/dev/null || true)
+
+    # Kill children recursively
+    for child in $children; do
+        kill_tree "$child" "$signal"
+    done
+
+    # Kill the process itself
+    kill -"$signal" "$pid" 2>/dev/null || true
+}
+
+# Wait for a process to die, with timeout
+wait_for_death() {
+    local pid="$1"
+    local timeout="${2:-10}"
+    local waited=0
+
+    while kill -0 "$pid" 2>/dev/null && [[ $waited -lt $timeout ]]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    ! kill -0 "$pid" 2>/dev/null
+}
+
+# Find uvicorn PIDs by port
+find_uvicorn_by_port() {
+    local port="$1"
+    lsof -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+}
+
+# Cleanup function for graceful shutdown
+cleanup() {
+    echo -e "\n${YELLOW}🧹 Cleaning up processes...${NC}"
+
+    # Collect all PIDs to kill (uvicorn processes on our ports)
+    local pids_to_kill=()
+    local api_port="${SERVER_PORT:-8000}"
+    local model_port="${MODEL_SERVICE_PORT:-7705}"
+
+    # Find uvicorn processes by port (more reliable than tracking pipeline PIDs)
+    for port in "$api_port" "$model_port"; do
+        local port_pids
+        port_pids=$(find_uvicorn_by_port "$port")
+        for pid in $port_pids; do
+            pids_to_kill+=("$pid")
+            echo -e "${BLUE}   Found process on port $port: PID $pid${NC}"
+        done
+    done
+
+    # Also check PID file for any tracked processes
+    if [[ -f "$PID_FILE" ]]; then
+        while IFS='=' read -r name pid; do
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                pids_to_kill+=("$pid")
+                echo -e "${BLUE}   Found tracked process $name: PID $pid${NC}"
+            fi
+        done < "$PID_FILE"
+        rm -f "$PID_FILE"
+    fi
+
+    # Phase 1: Send SIGTERM to all uvicorn processes (triggers FastAPI shutdown + atexit)
+    echo -e "${BLUE}📤 Sending SIGTERM to processes...${NC}"
+    for pid in "${pids_to_kill[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # Phase 2: Wait for graceful shutdown (gives vLLM time to clean up children)
+    echo -e "${BLUE}⏳ Waiting for graceful shutdown (up to 10s)...${NC}"
+    local all_dead=true
+    for pid in "${pids_to_kill[@]}"; do
+        if ! wait_for_death "$pid" 10; then
+            all_dead=false
+            echo -e "${YELLOW}   PID $pid still alive after timeout${NC}"
+        fi
+    done
+
+    # Phase 3: Force kill any remaining uvicorn processes
+    if [[ "$all_dead" != "true" ]]; then
+        echo -e "${YELLOW}🔪 Force killing remaining processes...${NC}"
+        for pid in "${pids_to_kill[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill_tree "$pid" KILL
+            fi
+        done
+        sleep 1
+    fi
+
+    # Phase 4: Clean up any orphaned vLLM processes
+    local vllm_pids
+    vllm_pids=$(pgrep -f "VLLM::EngineCore" 2>/dev/null || true)
+    if [[ -n "$vllm_pids" ]]; then
+        echo -e "${YELLOW}🔪 Killing orphaned vLLM processes: $vllm_pids${NC}"
+        for pid in $vllm_pids; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+    fi
+
+    # Clear CUDA cache if available
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        echo -e "${BLUE}🧹 Clearing CUDA cache...${NC}"
+        python3 -c "
+try:
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print('✅ CUDA cache cleared')
+except ImportError:
+    pass
+" 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}✅ Cleanup completed${NC}"
+}
+
+# Set up signal handlers
+setup_signal_handlers() {
+    # Remove stale PID file
+    rm -f "$PID_FILE"
+
+    # Trap signals for cleanup
+    trap cleanup EXIT INT TERM HUP
+}
+
+# Start server with appropriate configuration
+start_server() {
+    local enable_reload="${1:-true}"
+    local host="${2:-0.0.0.0}"
+    local port="${3:-${SERVER_PORT:-8000}}"
+    
+    echo -e "${GREEN}🚀 Starting Jarvis LLM Proxy API...${NC}"
+    echo -e "${BLUE}📍 Server will be available at: http://$host:$port${NC}"
+    echo -e "${BLUE}📍 Health check: http://$host:$port/health${NC}"
+    echo -e "${BLUE}📍 API docs: http://$host:$port/docs${NC}"
+    
+    # Check if using vLLM - it doesn't work well with uvicorn workers
+    local using_vllm=false
+    if [[ "${JARVIS_INFERENCE_ENGINE:-}" == "vllm" ]] || [[ "${JARVIS_MODEL_BACKEND:-}" == "VLLM" ]] || [[ "${JARVIS_LIGHTWEIGHT_MODEL_BACKEND:-}" == "VLLM" ]]; then
+        using_vllm=true
+    fi
+    
+    if [[ "$enable_reload" == "true" ]]; then
+        echo -e "${YELLOW}🔄 Development mode: auto-reload enabled (single worker)${NC}"
+        "$VENV/bin/uvicorn" main:app --host "$host" --port "$port" --reload
+    elif [[ "$using_vllm" == "true" ]]; then
+        echo -e "${BLUE}🚀 vLLM mode: async single worker with high concurrency${NC}"
+        echo -e "${YELLOW}   → vLLM handles request batching internally for optimal throughput${NC}"
+        "$VENV/bin/uvicorn" main:app --host "$host" --port "$port" --loop asyncio --limit-concurrency 1000
+    else
+        local workers="${UVICORN_WORKERS:-1}"
+        echo -e "${GREEN}⚡ Production mode: using ${workers} worker(s) for parallel requests${NC}"
+        "$VENV/bin/uvicorn" main:app --host "$host" --port "$port" --workers "$workers"
+    fi
+}

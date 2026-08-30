@@ -1,0 +1,121 @@
+# AMD ROCm variant: same service, HIP/ROCm-enabled torch + whisper.cpp built with HIP.
+# Builds an image that runs resemblyzer (speaker recognition) on AMD GPUs via ROCm,
+# matching the CUDA variant's feature set for AMD hosts. On a single-GPU host this
+# shaves the same ~5-9s off transcription that CUDA does vs the slim CPU image.
+#
+# Build:  docker build -f Dockerfile.rocm -t jarvis-whisper-api:rocm .
+# Run:    docker run --device=/dev/dri --device=/dev/kfd \
+#                    --group-add video --group-add render \
+#                    -p 7706:7706 jarvis-whisper-api:rocm
+#
+# Requires an AMD GPU with a ROCm-supported architecture and the AMDGPU kernel
+# driver on the host. ROCm 7.2 base — required for RDNA4 / gfx1201 (RX 9070 /
+# 9070 XT); 6.3 predates that arch. 7.2 also satisfies whisper.cpp's HIP floor
+# (>= 6.3, where the __hip_fp8_e4m3 type its bindings reference first appeared).
+
+# Pinned by digest to prevent silent upstream drift (see Dockerfile.gpu
+# for the incident that motivated this). To refresh deliberately:
+#   docker buildx imagetools inspect rocm/dev-ubuntu-22.04:7.2.4-complete
+FROM rocm/dev-ubuntu-22.04:7.2.4-complete@sha256:e3909c89d9434e2816568f727e89bf6a00d6d9d746defc6b9957dbeb16d1ac31 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rocm/lib:${LD_LIBRARY_PATH}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    wget \
+    pkg-config \
+    libopenblas-dev \
+    libsndfile1 \
+    ffmpeg \
+    curl \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+WORKDIR /app
+
+# Build whisper.cpp with HIP (GPU-accelerated transcription on AMD).
+#
+# WHISPER_AMDGPU_TARGETS: AMDGPU arch list (semicolon-separated). Defaults cover
+# RDNA2/3/4 consumer cards:
+#     gfx1030  RX 6800 / 6900 (RDNA2)
+#     gfx1100  RX 7900 (RDNA3 N31)
+#     gfx1101  RX 7800 (RDNA3 N32)
+#     gfx1102  RX 7700 / 7600 (RDNA3 N33)
+#     gfx1200  RX 9060 (RDNA4)
+#     gfx1201  RX 9070 / 9070 XT (RDNA4)
+#   RDNA4 needs the ROCm 7.x base and its ISA must be compiled natively —
+#   HSA_OVERRIDE_GFX_VERSION masquerading does not work for gfx120x.
+#   Override at build time:  --build-arg WHISPER_AMDGPU_TARGETS=gfx1100
+#
+# We build only the whisper-cli target (skip whisper-bench) for parity with the
+# CUDA Dockerfile and to avoid pulling in optional examples.
+ARG WHISPER_MODEL_NAME=base.en
+ARG WHISPER_AMDGPU_TARGETS="gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+# Pin whisper.cpp to the commit our last GREEN ROCm build (v0.1.16, 2026-06-09)
+# used. Upstream main's HIP target broke after this commit and reddened
+# v0.1.17/v0.1.18; HIP can't be validated in CI without AMD hardware, so we pin
+# for reproducible builds instead of tracking main. Bump this deliberately only
+# after confirming a newer commit builds the HIP target.
+ARG WHISPER_CPP_REF=84bd03a438454a82150853dce83818013c6609d2
+RUN git clone https://github.com/ggerganov/whisper.cpp.git /root/whisper.cpp \
+    && cd /root/whisper.cpp \
+    && git checkout ${WHISPER_CPP_REF} \
+    && bash ./models/download-ggml-model.sh ${WHISPER_MODEL_NAME} \
+    && cmake -B build \
+        -DGGML_HIP=ON \
+        -DGGML_NATIVE=OFF \
+        -DAMDGPU_TARGETS="${WHISPER_AMDGPU_TARGETS}" \
+        -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+        -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+        -DCMAKE_INSTALL_RPATH=/opt/rocm/lib:/usr/local/lib \
+    && cmake --build build --config Release --target whisper-cli -j$(nproc) \
+    && cp build/bin/whisper-cli /usr/local/bin/whisper-cli \
+    && find build -name 'lib*.so*' -exec cp {} /usr/local/lib/ \; \
+    && ldconfig
+
+COPY app /app/app
+COPY alembic /app/alembic
+COPY alembic.ini /app/alembic.ini
+COPY pyproject.toml .
+
+# Install ROCm-enabled torch wheel BEFORE installing the project, so resemblyzer's
+# torch dep doesn't pull the CPU wheel. torch+ROCm exposes the HIP backend through
+# the torch.cuda API (CUDA-compatible), so JARVIS_VOICE_DEVICE=cuda still selects
+# the GPU at runtime. The rocm7.2 wheel index matches the base image's ROCm
+# major and is needed for RDNA4: rocm6.3 wheels carry no gfx1201 code objects,
+# and their bundled ROCm 6 runtime would race the 7.2 /opt/rocm libs on
+# LD_LIBRARY_PATH for any soname the two lines share.
+#
+# pywhispercpp ships CPU-only wheels on PyPI. Force a source build with HIP so it
+# links against ROCm libs and runs whisper.cpp inference on the GPU. Pinned
+# version matches pyproject.toml.
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/rocm7.2 torch torchaudio \
+    && AMDGPU_TARGETS="${WHISPER_AMDGPU_TARGETS}" \
+       GGML_HIP=1 ROCM_PATH=/opt/rocm GGML_NATIVE=0 \
+       pip install --no-cache-dir --no-binary pywhispercpp pywhispercpp==1.4.1 \
+    && pip install --no-cache-dir .
+
+ENV PORT=7706 \
+    WHISPER_MODEL=/root/whisper.cpp/models/ggml-base.en.bin \
+    WHISPER_CLI=/usr/local/bin/whisper-cli \
+    JARVIS_VOICE_DEVICE=cuda
+
+EXPOSE 7706
+
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT}

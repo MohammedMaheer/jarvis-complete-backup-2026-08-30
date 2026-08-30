@@ -1,0 +1,82 @@
+{
+  "version": "1.0.0",
+  "services": [
+    {
+      "id": "auth",
+      "name": "Jarvis Auth",
+      "description": "JWT authentication service",
+      "category": "core",
+      "port": 7701,
+      "image": "jarvis-auth:latest",
+      "healthCheck": "/health",
+      "dependsOn": [],
+      "envVars": [
+        {
+          "name": "SECRET_KEY",
+          "description": "JWT signing key",
+          "required": true,
+          "secret": true
+        }
+      ]
+    },
+    {
+      "id": "command-center",
+      "name": "Command Center",
+      "description": "Central voice/command API",
+      "category": "core",
+      "port": 7703,
+      "image": "jarvis-command-center:latest",
+      "healthCheck": "/health",
+      "dependsOn": [
+        "auth"
+      ],
+      "envVars": []
+    },
+    {
+      "id": "recipes",
+      "name": "Jarvis Recipes",
+      "description": "Recipe management",
+      "category": "optional",
+      "port": 7030,
+      "image": "jarvis-recipes:latest",
+      "healthCheck": "/health",
+      "dependsOn": [
+        "auth"
+      ],
+      "envVars": [],
+      "profile": "recipes"
+    },
+    {
+      "id": "ocr",
+      "name": "Jarvis OCR",
+      "description": "OCR service",
+      "category": "optional",
+      "port": 7031,
+      "image": "jarvis-ocr:latest",
+      "healthCheck": "/health",
+      "dependsOn": [],
+      "envVars": [],
+      "profile": "ocr"
+    }
+  ],
+  "infrastructure": [
+    {
+      "id": "postgres",
+      "name": "PostgreSQL",
+      "description": "Primary database",
+      "image": "postgres:16",
+      "port": 5432,
+      "envVars": [
+        {
+          "name": "POSTGRES_PASSWORD",
+          "description": "DB password",
+          "required": true,
+          "secret": true
+        }
+      ],
+      "volumes": [
+        "postgres-data:/var/lib/postgresql/data"
+      ]
+    }
+  ]
+}

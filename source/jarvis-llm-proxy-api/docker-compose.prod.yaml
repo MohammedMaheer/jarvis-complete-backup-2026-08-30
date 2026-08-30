@@ -1,0 +1,118 @@
+# ============================================================================
+# Jarvis LLM Proxy API — Production Compose (vLLM + CUDA)
+# ============================================================================
+# Usage:
+#   docker compose -f docker-compose.prod.yaml up -d
+#   docker compose -f docker-compose.prod.yaml up -d --build
+#
+# Prerequisites:
+#   - NVIDIA GPU + Container Toolkit (nvidia-ctk)
+#   - External PostgreSQL and Redis
+#   - .env file configured for production
+#   - Models downloaded to .models/ directory
+# ============================================================================
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env
+  environment:
+    - VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - MODEL_SERVICE_URL=http://llm-proxy-model:7705
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    # Models mounted from host (not baked into image)
+    - ./.models:/app/.models:ro
+    # Adapter storage (read-write for training output)
+    - ./adapters:/tmp/jarvis-adapters
+  restart: unless-stopped
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  # --------------------------------------------------------------------------
+  # API Server (port 7704)
+  # --------------------------------------------------------------------------
+  llm-proxy-api:
+    <<: *common
+    container_name: llm-proxy-api
+    ports:
+      - "${SERVER_PORT:-7704}:7704"
+    command: >
+      python -m uvicorn main:app
+      --host 0.0.0.0
+      --port 7704
+      --workers ${UVICORN_WORKERS:-1}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7704/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      llm-proxy-model:
+        condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # Model Service (port 7705)
+  # --------------------------------------------------------------------------
+  llm-proxy-model:
+    <<: *common
+    container_name: llm-proxy-model
+    ports:
+      # Loopback-only by default: containers reach the model service over the
+      # compose network (llm-proxy-model:7705); the host publish exists for
+      # same-box debugging. Set MODEL_SERVICE_BIND_HOST=0.0.0.0 to expose.
+      - "${MODEL_SERVICE_BIND_HOST:-127.0.0.1}:${MODEL_SERVICE_PORT:-7705}:7705"
+    command: >
+      python -m uvicorn services.model_service:app
+      --host 0.0.0.0
+      --port 7705
+    # :7705 /health is deliberately HTTP 200 whenever the process is alive
+    # (bind-first + fault-isolated loads), so `curl -f` can never fail —
+    # assert the BODY instead: healthy iff the live slot is ready ("ok"),
+    # preserving the pre-bind-first contract that `service_healthy` (the API
+    # and worker gates below) means "weights actually loaded". A read TIMEOUT
+    # exits 0: the single-worker model service blocks its event loop for the
+    # whole of a sync non-streaming generation, and busy must not flap the
+    # container unhealthy.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, sys, urllib.request
+          try:
+              body = json.load(urllib.request.urlopen("http://localhost:7705/health", timeout=5))
+          except TimeoutError:
+              sys.exit(0)  # busy generating (event loop blocked) — process alive
+          except Exception:
+              sys.exit(1)  # refused / dead
+          sys.exit(0 if body.get("status") == "ok" else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # --------------------------------------------------------------------------
+  # Queue Worker
+  # --------------------------------------------------------------------------
+  llm-proxy-worker:
+    <<: *common
+    container_name: llm-proxy-worker
+    environment:
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - MODEL_SERVICE_URL=http://llm-proxy-model:7705
+      - LLM_PROXY_PROCESS_ROLE=worker
+    command: python scripts/queue_worker.py
+    depends_on:
+      llm-proxy-model:
+        condition: service_healthy

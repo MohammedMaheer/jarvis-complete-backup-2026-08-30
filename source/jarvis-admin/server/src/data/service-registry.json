@@ -1,0 +1,719 @@
+{
+  "version": "3.0.0",
+  "platformVersion": "0.1.90",
+  "services": [
+    {
+      "id": "jarvis-config-service",
+      "name": "Config Service",
+      "description": "Centralized configuration and service discovery hub",
+      "category": "core",
+      "port": 7700,
+      "image": "ghcr.io/alexberardi/jarvis-config-service:latest",
+      "healthCheck": "/health",
+      "migrate": true,
+      "dependsOn": [
+        "postgres"
+      ],
+      "database": "jarvis_config",
+      "dbDriverPrefix": "postgresql://",
+      "envVars": [
+        {
+          "name": "DATABASE_URL",
+          "description": "PostgreSQL connection string",
+          "required": true
+        },
+        {
+          "name": "MIGRATIONS_DATABASE_URL",
+          "description": "PostgreSQL URL for Alembic migrations",
+          "required": true
+        },
+        {
+          "name": "JARVIS_CONFIG_ADMIN_TOKEN",
+          "description": "Admin token for write operations",
+          "required": true,
+          "secret": true,
+          "secretRef": "JARVIS_CONFIG_ADMIN_TOKEN"
+        },
+        {
+          "name": "JARVIS_AUTH_ADMIN_TOKEN",
+          "description": "Token for auth admin endpoints",
+          "required": true,
+          "secret": true,
+          "secretRef": "JARVIS_AUTH_ADMIN_TOKEN"
+        },
+        {
+          "name": "JARVIS_AUTH_URL",
+          "description": "Auth service URL",
+          "required": false,
+          "default": "http://jarvis-auth:8000"
+        }
+      ]
+    },
+    {
+      "id": "jarvis-auth",
+      "name": "Auth Service",
+      "description": "JWT authentication with register, login, refresh, and logout",
+      "category": "core",
+      "port": 7701,
+      "containerPort": 8000,
+      "image": "ghcr.io/alexberardi/jarvis-auth:latest",
+      "healthCheck": "/health",
+      "migrate": true,
+      "dependsOn": [
+        "postgres",
+        "jarvis-config-service"
+      ],
+      "database": "jarvis_auth",
+      "dbDriverPrefix": "postgresql+psycopg2://",
+      "envVars": [
+        {
+          "name": "DATABASE_URL",
+          "description": "PostgreSQL connection string",
+          "required": true
+        },
+        {
+          "name": "AUTH_SECRET_KEY",
+          "description": "JWT signing key",
+          "required": true,
+          "secret": true,
+          "secretRef": "AUTH_SECRET_KEY"
+        },
+        {
+          "name": "JARVIS_AUTH_ADMIN_TOKEN",
+          "description": "Admin token for auth endpoints",
+          "required": true,
+          "secret": true,
+          "secretRef": "JARVIS_AUTH_ADMIN_TOKEN"
+        },
+        {
+          "name": "JARVIS_CONFIG_URL",
+          "description": "Config service URL",
+          "required": false,
+          "default": "http://jarvis-config-service:7700"
+        }
+      ]
+    },
+    {
+      "id": "jarvis-logs",
+      "name": "Logging Service",
+      "description": "Centralized logging for all Jarvis services via Loki",
+      "category": "core",
+      "port": 7702,
+      "image": "ghcr.io/alexberardi/jarvis-logs:latest",
+      "healthCheck": "/health",
+      "dependsOn": [
+        "loki",
+        "jarvis-auth"
+      ],
+      "envVars": [
+        {
+          "name": "LOKI_URL",
+          "description": "Loki push endpoint",
+          "required": true,
+          "default": "http://loki:3100"
+        },
+        {
+          "name": "JARVIS_CONFIG_URL",
+          "description": "Config service URL",
+          "required": false,
+          "default": "http://jarvis-config-service:7700"
+        },
+        {
+          "name": "JARVIS_AUTH_BASE_URL",
+          "description": "Auth service URL",
+          "required": false,
+          "default": "http://jarvis-auth:8000"
+        }
+      ]
+    },
+    {
+      "id": "jarvis-command-center",
+      "name": "Command Center",
+      "description": "Central voice/command API, node management, and tool routing",
+      "category": "core",
+      "port": 7703,
+      "containerPort": 8002,
+      "image": "ghcr.io/alexberardi/jarvis-command-center:latest",
+      "healthCheck": "/health",
+      "migrate": true,
+      "dependsOn": [
+        "postgres",
+        "mosquitto",
+        "jarvis-auth",
+        "jarvis-config-service"
+      ],
+      "database": "jarvis_command_center",
+      "dbDriverPrefix": "postgresql://",
+      "volumes": [
+        "command-center-prompt-providers:/app/core/prompt_providers_custom"
+      ],
+      "llmInterfaceOptions": [
+        {
+          "id": "JarvisToolModel",
+          "name": "Llama Tool Model",
+          "description": "Full tool descriptions with all examples (default)",
+          "default": true
+        },
+        {
+          "id": "Qwen25MediumUntrained",
+          "name": "Qwen 2.5 Medium",
+          "description": "Optimized for Qwen 2.5 7B-14B models"
+        },
+        {
+          "id": "HermesMediumUntrained",
+          "name": "Hermes 8B Instruct",
+          "description": "Hermes 3 with native function calling"
+        }
+      ],
+      "envVars": [
+        {
+          "name": "DATABASE_URL",
+          "description": "PostgreSQL connection string",
+          "required": true
+        },
+        {
+          "name": "ADMIN_API_KEY",
+          "description": "Admin endpoint protection",
+          "required": true,
+          "secret": true,
+          "secretRef": "ADMIN_API_KEY"
+        },
+        {
+          "name": "JARVIS_AUTH_SECRET_KEY",
+          "description": "JWT signing key (shared with jarvis-auth)",
+          "required": true,
+          "secret": true,
+          "secretRef": "AUTH_SECRET_KEY"
+        },
+        {
+          "name": "JARVIS_CONFIG_URL",
+          "description": "Config service URL",
+          "required": false,
+          "default": "http://jarvis-config-service:7700"
+        },
+        {
+          "name": "JARVIS_MQTT_BROKER_URL",
+          "description": "MQTT broker URL for node communication",
+          "required": false,
+          "default": "mqtt://mosquitto:1884"
+        },
+        {
+          "name": "MQTT_USERNAME",
+          "description": "Shared broker username",
+          "required": false,
+          "default": "jarvis"
+        },
+        {
+          "name": "MQTT_PASSWORD",
+          "description": "Shared broker password (authenticates CC to mosquitto)",
+          "required": true,
+          "secret": true,
+          "secretRef": "MQTT_PASSWORD"
+        },
+        {
+          "name": "REDIS_URL",
+          "description": "Redis connection for the phone-call dial queue (CC enqueues dials the gateway consumes)",
+          "required": false,
+          "default": "redis://:${REDIS_PASSWORD}@redis:6379/0"
+        },
+        {
+          "name": "JARVIS_ADAPTER_CALLBACK_TOKEN",
+          "description": "CC-internal auth for async-job result callbacks (memory extraction, deep research, characterization synthesis, adapter training). CC attaches it at enqueue and validates it at the /…/callback endpoints (fail-closed); unset -> every callback 503s and nothing persists (save_memory, transcript mark_processed, inbox delivery).",
+          "required": true,
+          "secret": true,
+          "secretRef": "JARVIS_ADAPTER_CALLBACK_TOKEN"
+        }
+      ]
+    },
+    {
+      "id": "jarvis-whisper-api",
+      "name": "Whisper STT",
+      "description": "Speech-to-text via whisper.cpp (base.en model included)",
+      "category": "recommended",
+      "port": 7706,
+      "image": "ghcr.io/alexberardi/jarvis-whisper-api:latest",
+      "healthCheck": "/health",
+      "migrate": true,
+      "dependsOn": [
+        "postgres",
+        "jarvis-auth",
+        "jarvis-config-service"
+      ],
+      "database": "jarvis_whisper",
+      "dbDriverPrefix": "postgresql+psycopg2://",
+      "gpu": true,
+      "cpuFallback": true,
+      "nativeCapable": true,
+      "volumes": [
+        "whisper-voice-profiles:/app/voice_profiles"
+      ],
+      "modelOptions": [
+        {
+          "id": "base.en",
+          "name": "Base English",
+          "size": "~140MB",
+          "default": true,
+          "builtin": true
+        },
+        {
+          "id": "small.en",
+          "name": "Small English",
+          "size": "~460MB"
+        },
+        {
+          "id": "medium.en",
+          "name": "Medium English",
+          "size": "~1.5GB"
+        },
+        {
+          "id": "large-v3",
+          "name": "Large v3 (Multilingual)",
+          "size": "~3GB"
+        }
+      ],
+      "envVars": [
+        {
+          "name": "DATABASE_URL",
+          "description": "PostgreSQL connection string",
+          "required": true
+        },
+        {
+          "name": "JARVIS_CONFIG_URL",
+          "description": "Config service URL",
+          "required": false,
+          "default": "http://jarvis-config-service:7700"
+        },
+        {
+          "name": "JARVIS_AUTH_BASE_URL",
+          "description": "Auth service URL",
+          "required": false,
+          "default": "http://jarvis-auth:8000"
+        }
+      ]
+    },
+    {
+      "id": "jarvis-tts",
+      "name": "Text-to-Speech",
+      "description": "Text-to-speech synthesis with selectable provider (Piper default, Kokoro for natural prosody)",
+      "category": "recommended",
+      "port": 7707,
+      "image": "ghcr.io/alexberardi/jarvis-tts:latest",
+      "healthCheck": "/health",
+      "dependsOn": [
+        "postgres",
+        "jarvis-auth",
+        "jarvis-config-service"
+      ],
+      "database": "jarvis_tts",
+      "dbDriverPrefix": "postgresql+psycopg2://",
+      "migrate": true,
+      "envVars": [
+        {
+          "name": "DATABASE_URL",
+          "description": "PostgreSQL connection string",
+          "required": true
+        },
+        {
+          "name": "JARVIS_CONFIG_URL",
+          "description": "Config service URL",
+          "required": false,
+          "default": "http://jarvis-config-service:7700"
+        },
+        {
+          "name": "TTS_PROVIDER",
+          "description": "Active TTS provider (piper, kokoro)",
+          "required": false,
+          "default": "kokoro"
+        },
+        {
+          "name": "HF_HOME",
+          "description": "HuggingFace cache dir for Kokoro voice weights",
+          "required": false,
+          "default": "/app/models/hf_cache"
+        }
+      ],
+      "nativeCapable": true,
+      "volumes": [
+        "jarvis-tts-hf-cache:/app/models/hf_cache"
+      ]
+    },
+    {
+      "id": "jarvis-llm-proxy-api",
+      "name": "LLM Proxy",
+      "description": "LLM inference backend (GGUF/MLX on macOS, GGUF/vLLM on Linux)",
+      "category": "recommended",
+      "port": 7704,
+      "image": "ghcr.io/alexberardi/jarvis-llm-proxy-api:latest",
+      "healthCheck": "/health",
+      "migrate": true,
+      "dependsOn": [
+        "postgres",
+        "jarvis-auth",
+        "jarvis-config-service"
+      ],
+      "database": "jarvis_llm_proxy",
+      "dbDriverPrefix": "postgresql+psycopg2://",
+      "gpu": true,
+      "nativeCapable": true,
+      "envVars": [
+        {
+          "name": "DATABASE_URL",
+          "description": "PostgreSQL connection string",
+          "required": true
+        },
+        {
+          "name": "MIGRATIONS_DATABASE_URL",
+          "description": "PostgreSQL URL for Alembic migrations",
+          "required": true
+        },
+        {
+          "name": "JARVIS_CONFIG_URL",
+          "description": "Config service URL",
+          "required": false,
+          "default": "http://jarvis-config-service:7700"
+        }
+      ],
+      "ipc": "host",
+      "shmSize": "8gb",
+      "modelVolume": true,
+      "workers": [
+        {
+          "id": "llm-proxy-worker",
+          "command": "python scripts/queue_worker.py",
+          "envOverrides": {
+            "LLM_PROXY_PROCESS_ROLE": "worker",
+            "MODEL_SERVICE_URL": "http://jarvis-llm-proxy-api:7705"
+          }
+        }
+      ]
+    },
+    {
+      "id": "jarvis-notifications",
+      "name": "Notifications",
+      "description": "Push notifications, inbox, and device token management",
+      "category": "recommended",
+      "port": 7712,
+      "containerPort": 7712,
+      "image": "ghcr.io/alexberardi/jarvis-notifications:latest",
+      "healthCheck": "/health",
+      "migrate": true,
+      "dependsOn": [
+        "postgres",
+        "jarvis-auth",
+        "jarvis-config-service"
+      ],
+      "database": "jarvis_notifications",
+      "dbDriverPrefix": "postgresql+psycopg2://",
+      "envVars": [
+        {
+          "name": "DATABASE_URL",
+          "description": "PostgreSQL connection string",
+          "required": true
+        },
+        {
+          "name": "NOTIFICATIONS_PORT",
+          "description": "Server port",
+          "required": false,
+          "default": "7712"
+        },
+        {
+          "name": "AUTH_SECRET_KEY",
+          "description": "JWT signing key (must match jarvis-auth)",
+          "required": true,
+          "secret": true,
+          "secretRef": "AUTH_SECRET_KEY"
+        },
+        {
+          "name": "ADMIN_API_KEY",
+          "description": "Admin endpoint protection",
+          "required": true,
+          "secret": true,
+          "secretRef": "ADMIN_API_KEY"
+        },
+        {
+          "name": "JARVIS_CONFIG_URL",
+          "description": "Config service URL",
+          "required": false,
+          "default": "http://jarvis-config-service:7700"
+        },
+        {
+          "name": "JARVIS_AUTH_BASE_URL",
+          "description": "Auth service URL",
+          "required": false,
+          "default": "http://jarvis-auth:8000"
+        }
+      ]
+    },
+    {
+      "id": "jarvis-settings-server",
+      "name": "Settings Server",
+      "description": "Runtime settings aggregator for service configuration",
+      "category": "recommended",
+      "port": 7708,
+      "image": "ghcr.io/alexberardi/jarvis-settings-server:latest",
+      "healthCheck": "/health",
+      "dependsOn": [
+        "jarvis-auth",
+        "jarvis-config-service"
+      ],
+      "envVars": [
+        {
+          "name": "JARVIS_CONFIG_URL",
+          "description": "Config service URL",
+          "required": false,
+          "default": "http://jarvis-config-service:7700"
+        }
+      ]
+    },
+    {
+      "id": "jarvis-web",
+      "name": "Web Chat",
+      "description": "Web chat interface for interacting with Jarvis from a browser",
+      "category": "optional",
+      "port": 7722,
+      "image": "ghcr.io/alexberardi/jarvis-web:latest",
+      "healthCheck": "/",
+      "dependsOn": [
+        "jarvis-auth",
+        "jarvis-command-center"
+      ],
+      "envVars": [
+        {
+          "name": "JARVIS_CONFIG_URL",
+          "description": "Config service URL",
+          "required": false,
+          "default": "http://jarvis-config-service:7700"
+        }
+      ]
+    },
+    {
+      "id": "jarvis-osx-api",
+      "name": "macOS Bridge",
+      "description": "iMessage, Contacts, and Shortcuts bridge — macOS native only, runs as a LaunchAgent, never in Docker",
+      "category": "optional",
+      "port": 7723,
+      "image": "",
+      "healthCheck": "/health",
+      "dependsOn": [],
+      "envVars": [],
+      "nativeCapable": true,
+      "nativeOnly": true
+    },
+    {
+      "id": "jarvis-admin",
+      "name": "Admin Dashboard",
+      "description": "Web admin dashboard for managing Jarvis services and settings",
+      "category": "core",
+      "port": 7710,
+      "image": "ghcr.io/alexberardi/jarvis-admin:latest",
+      "healthCheck": "/health",
+      "dependsOn": [
+        "jarvis-auth",
+        "jarvis-config-service"
+      ],
+      "envVars": [
+        {
+          "name": "JARVIS_CONFIG_URL",
+          "description": "Config service URL",
+          "required": false,
+          "default": "http://jarvis-config-service:7700"
+        },
+        {
+          "name": "JARVIS_COMPOSE_PATH",
+          "description": "Where the host's docker-compose.yml + .env live (mounted into the container)",
+          "required": false,
+          "default": "/host/compose"
+        },
+        {
+          "name": "COMMAND_CENTER_ADMIN_KEY",
+          "description": "Admin API key for command-center admin endpoints (traces, node detail); shares the ADMIN_API_KEY secret",
+          "required": true,
+          "secret": true,
+          "secretRef": "ADMIN_API_KEY"
+        }
+      ],
+      "volumes": [
+        "/var/run/docker.sock:/var/run/docker.sock",
+        "${JARVIS_HOST_COMPOSE_DIR:-.}:/host/compose"
+      ]
+    },
+    {
+      "id": "jarvis-phone-gateway",
+      "name": "Phone Calls",
+      "description": "AI phone-call gateway — places user-confirmed outbound calls (reservations, orders) over Twilio using the local whisper/LLM/TTS pipeline",
+      "category": "optional",
+      "port": 7713,
+      "image": "ghcr.io/alexberardi/jarvis-phone-gateway:latest",
+      "healthCheck": "/health",
+      "dependsOn": [
+        "jarvis-auth",
+        "jarvis-config-service",
+        "jarvis-command-center"
+      ],
+      "envVars": [
+        {
+          "name": "JARVIS_CONFIG_URL",
+          "description": "Config service URL",
+          "required": false,
+          "default": "http://jarvis-config-service:7700"
+        },
+        {
+          "name": "REDIS_URL",
+          "description": "Redis connection for the dial queue",
+          "required": false,
+          "default": "redis://:${REDIS_PASSWORD}@redis:6379/0"
+        },
+        {
+          "name": "TWILIO_ACCOUNT_SID",
+          "description": "Twilio account SID (gateway-only secret — paste into .env; never stored in the settings DB)",
+          "required": true,
+          "secret": true,
+          "default": "${TWILIO_ACCOUNT_SID:-}"
+        },
+        {
+          "name": "TWILIO_AUTH_TOKEN",
+          "description": "Twilio auth token (also the media-stream signature verification key — paste into .env)",
+          "required": true,
+          "secret": true,
+          "default": "${TWILIO_AUTH_TOKEN:-}"
+        },
+        {
+          "name": "TWILIO_FROM_NUMBER",
+          "description": "E.164 caller-ID number owned by the Twilio account (paste into .env)",
+          "required": true,
+          "default": "${TWILIO_FROM_NUMBER:-}"
+        },
+        {
+          "name": "PHONE_GATEWAY_PUBLIC_WSS_URL",
+          "description": "Public wss:// URL Twilio Media Streams connects back to (named Cloudflare tunnel hostname, e.g. wss://calls.example.com)",
+          "required": true,
+          "default": "${PHONE_GATEWAY_PUBLIC_WSS_URL:-}"
+        }
+      ]
+    },
+    {
+      "id": "go2rtc",
+      "name": "Camera Streaming",
+      "description": "Live camera/doorbell streaming via go2rtc (Nest cameras)",
+      "category": "optional",
+      "port": 1984,
+      "image": "alexxit/go2rtc",
+      "healthCheck": "/api",
+      "dependsOn": [],
+      "envVars": []
+    }
+  ],
+  "infrastructure": [
+    {
+      "id": "postgres",
+      "name": "PostgreSQL",
+      "description": "Primary database \u2014 stores users, commands, settings, and service config",
+      "image": "pgvector/pgvector:pg16",
+      "port": 5432,
+      "envVars": [
+        {
+          "name": "POSTGRES_USER",
+          "description": "Database superuser",
+          "required": true,
+          "default": "jarvis"
+        },
+        {
+          "name": "POSTGRES_PASSWORD",
+          "description": "Database password",
+          "required": true,
+          "secret": true,
+          "secretRef": "POSTGRES_PASSWORD"
+        },
+        {
+          "name": "POSTGRES_DB",
+          "description": "Default database name",
+          "required": true,
+          "default": "jarvis_config"
+        }
+      ],
+      "volumes": [
+        "jarvis-postgres-data:/var/lib/postgresql/data"
+      ]
+    },
+    {
+      "id": "redis",
+      "name": "Redis",
+      "description": "Task queue \u2014 used for long-running jobs and async pipelines",
+      "image": "redis:7-alpine",
+      "port": 6379,
+      "envVars": [
+        {
+          "name": "REDIS_PASSWORD",
+          "description": "Redis password",
+          "required": true,
+          "secret": true,
+          "secretRef": "REDIS_PASSWORD"
+        }
+      ],
+      "volumes": [
+        "jarvis-redis-data:/data"
+      ]
+    },
+    {
+      "id": "loki",
+      "name": "Loki",
+      "description": "Logging database \u2014 collects and indexes logs from all services",
+      "image": "grafana/loki:2.9.0",
+      "port": 3100,
+      "envVars": [],
+      "volumes": [
+        "jarvis-loki-data:/loki"
+      ]
+    },
+    {
+      "id": "mosquitto",
+      "name": "Mosquitto",
+      "description": "MQTT message broker \u2014 node-to-service communication for TTS, commands, and settings",
+      "image": "eclipse-mosquitto:2.0",
+      "port": 1884,
+      "envVars": [
+        {
+          "name": "MQTT_USERNAME",
+          "description": "Shared broker username",
+          "required": false,
+          "default": "jarvis"
+        },
+        {
+          "name": "MQTT_PASSWORD",
+          "description": "Shared broker password (hashed into the password_file at startup)",
+          "required": true,
+          "secret": true,
+          "secretRef": "MQTT_PASSWORD"
+        },
+        {
+          "name": "MQTT_ALLOW_ANON",
+          "description": "Accept anonymous clients (transition window). Set false to lock the broker.",
+          "required": false,
+          "default": "true"
+        }
+      ],
+      "volumes": [
+        "jarvis-mosquitto-data:/mosquitto/data"
+      ]
+    },
+    {
+      "id": "grafana",
+      "name": "Grafana",
+      "description": "Monitoring dashboard \u2014 visualize logs and service health metrics",
+      "image": "grafana/grafana:latest",
+      "port": 3000,
+      "envVars": [
+        {
+          "name": "GF_SECURITY_ADMIN_PASSWORD",
+          "description": "Grafana admin password",
+          "required": true,
+          "secret": true,
+          "secretRef": "GRAFANA_ADMIN_PASSWORD"
+        }
+      ],
+      "volumes": [
+        "jarvis-grafana-data:/var/lib/grafana"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,214 @@
+"""Agent context retrieval for voice command enrichment.
+
+Searches household-wide memories (user_id IS NULL) injected by background
+agents (calendar, news, weather) and returns the most relevant ones for
+a given voice command.  Used during conversation processing to inject
+a "Current context" section into the LLM prompt.
+
+Retrieval strategy:
+1. Vector-search agent memories for ones that match the user's query
+2. Fallback to word-overlap substring search if embedding fails
+
+NOTE: this path used to FORCE the latest weather + calendar into every turn.
+The always-on situational snapshot now lives in the cached-prefix
+``<ambient_context>`` block (``ConversationHandler._assemble_ambient_bundle``),
+so forcing them here too double-injected weather and made the model bring it
+up in unrelated replies. Priority-forcing is disabled; weather/calendar now
+surface here only when the query actually matches them via vector search.
+"""
+
+import logging
+from datetime import datetime
+
+from sqlalchemy.orm import Session
+
+from app.models import UserMemory
+from app.services.memory_service import MemoryService
+
+logger = logging.getLogger("uvicorn")
+
+# Previously ["weather", "calendar"] — force-included every turn. Now empty: the
+# ambient_context block owns the always-on situational snapshot, so this per-turn
+# path stays purely query-relevant (see module docstring). Kept as a list so the
+# vector-search exclude filter (exclude_categories=PRIORITY_CATEGORIES) is a no-op.
+PRIORITY_CATEGORIES: list[str] = []
+
+
+class AgentContextService:
+    """Retrieve agent-injected context relevant to a voice command."""
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get_relevant_context(
+        self,
+        household_id: str,
+        query: str,
+        max_results: int = 5,
+        max_chars: int = 500,
+        similarity_threshold: float = 0.25,
+    ) -> str:
+        """Search agent memories and format for prompt injection.
+
+        Always includes the latest weather/calendar context, then fills
+        remaining slots with vector-search results from other categories.
+
+        Gated behind ``model.advanced_context`` — returns empty when
+        disabled so vector search and embedding queries are skipped.
+
+        Args:
+            household_id: The household scope
+            query: The user's voice command text
+            max_results: Maximum number of context items to return
+            max_chars: Maximum total characters for the formatted output
+            similarity_threshold: Minimum cosine similarity (0-1)
+
+        Returns:
+            Formatted string for prompt injection, or empty string.
+        """
+        # Defense-in-depth: conversation_handler also gates this, but
+        # guard here in case the service is called directly.
+        try:
+            from app.services.settings_service import get_settings_service
+
+            settings = get_settings_service()
+            val = settings.get("model.advanced_context", household_id=household_id)
+            if val is not None and str(val).lower() in ("false", "0"):
+                return ""
+        except Exception:
+            pass  # proceed if settings unavailable
+
+        results: list[str] = []
+
+        # Step 1: Always include latest from priority categories
+        priority_contents = self._get_priority_context(household_id)
+        results.extend(priority_contents)
+
+        # Step 2: Fill remaining slots with vector search (non-priority)
+        remaining = max_results - len(results)
+        if remaining > 0:
+            vector_results = self._search_vector(
+                household_id, query, remaining, similarity_threshold,
+                exclude_categories=PRIORITY_CATEGORIES,
+            )
+            if not vector_results:
+                vector_results = self._search_substring(
+                    household_id, query, remaining,
+                    exclude_categories=PRIORITY_CATEGORIES,
+                )
+            results.extend(vector_results)
+
+        if not results:
+            return ""
+
+        return self._format_results(results, max_chars)
+
+    def _get_priority_context(self, household_id: str) -> list[str]:
+        """Get the latest memory from each priority category."""
+        contents: list[str] = []
+        now = datetime.utcnow()
+
+        for category in PRIORITY_CATEGORIES:
+            memory = (
+                self.db.query(UserMemory)
+                .filter(
+                    UserMemory.user_id.is_(None),
+                    UserMemory.household_id == household_id,
+                    UserMemory.category == category,
+                    UserMemory.is_active == True,  # noqa: E712
+                )
+                .filter(
+                    (UserMemory.expires_at == None) | (UserMemory.expires_at > now)  # noqa: E711
+                )
+                .order_by(UserMemory.updated_at.desc())
+                .first()
+            )
+            if memory:
+                contents.append(memory.content)
+
+        return contents
+
+    def _search_vector(
+        self,
+        household_id: str,
+        query: str,
+        limit: int,
+        threshold: float,
+        exclude_categories: list[str] | None = None,
+    ) -> list[str]:
+        """Try vector similarity search. Returns list of content strings."""
+        try:
+            from app.core.llm_proxy_client import LLMProxyClient
+
+            client = LLMProxyClient()
+            vectors = client.create_embeddings_sync([query])
+
+            if not vectors or not vectors[0]:
+                return []
+
+            service = MemoryService(self.db)
+            matches = service.search_household_memories(
+                household_id=household_id,
+                query_embedding=vectors[0],
+                limit=limit,
+                similarity_threshold=threshold,
+            )
+
+            results = []
+            for m, _score in matches:
+                if exclude_categories and m.category in exclude_categories:
+                    continue
+                results.append(m.content)
+
+            return results[:limit]
+
+        except Exception as e:
+            logger.debug("Agent context vector search failed, will try substring: %s", e)
+            return []
+
+    def _search_substring(
+        self,
+        household_id: str,
+        query: str,
+        limit: int,
+        exclude_categories: list[str] | None = None,
+    ) -> list[str]:
+        """Fallback to word-overlap substring search."""
+        try:
+            service = MemoryService(self.db)
+            matches = service.search_household_memories_substring(
+                household_id=household_id,
+                query=query,
+                limit=limit,
+            )
+
+            results = []
+            for m, _score in matches:
+                if exclude_categories and m.category in exclude_categories:
+                    continue
+                results.append(m.content)
+
+            return results[:limit]
+
+        except Exception as e:
+            logger.warning("Agent context substring search failed: %s", e)
+            return []
+
+    @staticmethod
+    def _format_results(contents: list[str], max_chars: int) -> str:
+        """Format results as a 'Current context' block for prompt injection."""
+        lines: list[str] = []
+        header = "You already know the following — weave relevant facts into your answer:"
+        total_chars = len(header) + 1
+
+        for content in contents:
+            line = f"- {content}"
+            if total_chars + len(line) + 1 > max_chars:
+                break
+            lines.append(line)
+            total_chars += len(line) + 1
+
+        if not lines:
+            return ""
+
+        return header + "\n" + "\n".join(lines)

@@ -1,0 +1,34 @@
+services:
+  jarvis-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "7710:7710"
+      - "7711:7711"
+    volumes:
+      - ./src:/app/src
+      - ./public:/app/public
+      - ./index.html:/app/index.html
+      - ./vite.config.ts:/app/vite.config.ts
+      - ./tsconfig.json:/app/tsconfig.json
+      - ./tsconfig.app.json:/app/tsconfig.app.json
+      - ./tsconfig.node.json:/app/tsconfig.node.json
+      - ./server/src:/app/server/src
+      - ./server/tsconfig.json:/app/server/tsconfig.json
+      - ./.env:/app/.env
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOME}/.jarvis/compose:/host/compose
+      - ${MODELS_DIR:-../jarvis-llm-proxy-api/.models}:/models
+    env_file:
+      - .env
+    environment:
+      - PORT=7711
+      - DOCKER_SOCKET=/var/run/docker.sock
+      - MODELS_DIR=/models
+      # Stack env managed by the ./jarvis CLI on dev machines — the service
+      # credentials panel reads/writes it. Registry drives the panel content.
+      - JARVIS_COMPOSE_PATH=/host/compose
+      - REGISTRY_PATH=/app/server/src/data/service-registry.json
+    extra_hosts:
+      - "${DOCKER_HOST_ALIAS:-host.docker.internal}:host-gateway"

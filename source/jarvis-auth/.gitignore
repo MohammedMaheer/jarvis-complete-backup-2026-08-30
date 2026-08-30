@@ -1,0 +1,34 @@
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# Environments / tooling
+.venv/
+venv/
+.env
+.env.local
+.python-version
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+nvim-tree.lua
+*.swp
+*.swo
+
+# Builds / dist
+build/
+dist/
+*.egg-info/
+
+# Docker / Compose overrides
+docker-compose.override.yml
+

@@ -1,0 +1,14 @@
+services:
+  jarvis-pantry:
+    build: .
+    ports:
+      - "${PANTRY_PORT:-7721}:${PANTRY_PORT:-7721}"
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "${DOCKER_HOST_ALIAS:-host.docker.internal}:host-gateway"
+    restart: unless-stopped

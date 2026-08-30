@@ -1,0 +1,620 @@
+import asyncio
+import httpx
+import json
+import logging
+import os
+import threading
+import time
+from typing import List, Dict, Any, Optional
+from urllib.parse import urljoin
+
+from managers.chat_types import ChatResult, GenerationParams, ImagePart, NormalizedMessage, TextPart
+from backends.base import LLMBackendBase
+from services.settings_helpers import get_int_setting, get_setting
+
+logger = logging.getLogger("uvicorn")
+
+
+class RestClient(LLMBackendBase):
+    def __init__(self, base_url: str, model_name: str = "jarvis-llm", model_type: str = "main"):
+        """
+        Initialize REST client for remote API providers
+        
+        Args:
+            base_url: Base URL for the API (e.g., http://localhost:11434, https://api.openai.com)
+            model_name: Model name to use for requests
+            model_type: Type of model ("live" or "background")
+        """
+        self.base_url = base_url.rstrip('/')
+        self.model_type = model_type
+        
+        # Allow environment variable override of model name based on model type
+        if model_type == "background":
+            env_model_name = get_setting(
+                "model.background.rest_model_name",
+                "JARVIS_REST_BACKGROUND_MODEL_NAME",
+                "",
+            )
+        else:
+            env_model_name = get_setting(
+                "model.main.rest_model_name",
+                "JARVIS_REST_MODEL_NAME",
+                "",
+            )
+            
+        if env_model_name:
+            self.model_name = env_model_name
+        else:
+            self.model_name = model_name
+
+        self.last_usage = None
+        self.inference_engine = "rest"  # Remote API backend
+        
+        # Get authentication configuration (DB setting first, env fallback)
+        self.auth_type = get_setting(
+            "rest.auth_type", "JARVIS_REST_AUTH_TYPE", "none"
+        ).lower()
+        self.auth_token = get_setting(
+            "rest.auth_token", "JARVIS_REST_AUTH_TOKEN", ""
+        )
+        self.auth_header_name = get_setting(
+            "rest.auth_header_name", "JARVIS_REST_AUTH_HEADER", "Authorization"
+        )
+        
+        # Get provider-specific configuration
+        self.provider = get_setting(
+            "rest.provider", "JARVIS_REST_PROVIDER", "generic"
+        ).lower()
+        
+        # Get request format configuration
+        self.request_format = get_setting(
+            "rest.request_format", "JARVIS_REST_REQUEST_FORMAT", "openai"
+        ).lower()
+        
+        # Get timeout configuration
+        self.timeout = get_int_setting(
+            "rest.timeout_seconds", "JARVIS_REST_TIMEOUT", 60
+        )
+
+        # Default thinking budget for reasoning models (e.g. Qwen3.5 served via
+        # llama-server) — used ONLY when a request omits reasoning_budget. Per-slot
+        # with a model.main fallback. 0 = off (immediate end of thinking — the fast
+        # voice default), -1 = unrestricted, N = token cap. Blank/unset → None: send
+        # nothing and let the server's own --reasoning-budget launch flag apply.
+        # Explicit empty-check (NOT `or`): "0" is a real value (off), not "unset".
+        _rb = get_setting(f"model.{self.model_type}.reasoning_budget", "", "")
+        if str(_rb).strip() == "":
+            _rb = get_setting("model.main.reasoning_budget", "JARVIS_REST_REASONING_BUDGET", "")
+        try:
+            self._default_reasoning_budget: Optional[int] = (
+                int(_rb) if str(_rb).strip() not in ("", "None") else None
+            )
+        except (TypeError, ValueError):
+            self._default_reasoning_budget = None
+
+        logger.info(f"🌐 Initialized REST backend for {self.provider}")
+        logger.debug(f"🔗 Base URL: {self.base_url}")
+        logger.debug(f"🔑 Auth type: {self.auth_type}")
+        logger.debug(f"📝 Request format: {self.request_format}")
+        
+        # Initialize HTTP client
+        self.client = httpx.AsyncClient(timeout=self.timeout)
+
+        # Dedicated background event loop for the sync->async bridge (see
+        # generate_text_chat). Lazily started; keeps self.client bound to one
+        # stable loop across requests.
+        self._bg_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._bg_loop_lock = threading.Lock()
+
+        # Set up headers
+        self.headers = self._setup_headers()
+    
+    def _setup_headers(self) -> Dict[str, str]:
+        """Set up headers based on authentication type and provider"""
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Jarvis-LLM-Proxy/1.0"
+        }
+        
+        if self.auth_type == "bearer" and self.auth_token:
+            headers[self.auth_header_name] = f"Bearer {self.auth_token}"
+        elif self.auth_type == "api_key" and self.auth_token:
+            headers[self.auth_header_name] = self.auth_token
+        elif self.auth_type == "custom" and self.auth_token:
+            # For custom auth patterns, expect JARVIS_REST_AUTH_HEADER to be set
+            headers[self.auth_header_name] = self.auth_token
+        
+        return headers
+    
+    def _format_messages_for_provider(self, messages: List[Dict[str, str]]) -> Any:
+        """Format messages according to provider requirements"""
+        if self.request_format == "openai":
+            # OpenAI format: {"messages": [...], "model": "...", "temperature": ...}
+            return {
+                "messages": messages,
+                "model": self.model_name
+            }
+        elif self.request_format == "ollama":
+            # Ollama format: {"messages": [...], "model": "..."}
+            return {
+                "messages": messages,
+                "model": self.model_name
+            }
+        elif self.request_format == "chatml":
+            # ChatML format: concatenated text with role prefixes
+            formatted = ""
+            for msg in messages:
+                role = msg["role"]
+                content = msg["content"]
+                if role == "system":
+                    formatted += f"<|im_start|>system\n{content}<|im_end|>\n"
+                elif role == "user":
+                    formatted += f"<|im_start|>user\n{content}<|im_end|>\n"
+                elif role == "assistant":
+                    formatted += f"<|im_start|>assistant\n{content}<|im_end|>\n"
+            formatted += "<|im_start|>assistant\n"
+            return {"prompt": formatted}
+        else:
+            # Generic format: pass through as-is
+            return {"messages": messages}
+    
+    def _get_endpoint_for_provider(self) -> str:
+        """Get the appropriate endpoint for the provider"""
+        if self.provider == "openai":
+            return "/v1/chat/completions"
+        elif self.provider == "anthropic":
+            return "/v1/messages"
+        elif self.provider == "ollama":
+            return "/api/chat"
+        elif self.provider == "lmstudio":
+            return "/v1/chat/completions"
+        else:
+            # Generic endpoint
+            return "/v1/chat/completions"
+    
+    def _parse_response_for_provider(self, response_data: Dict[str, Any]) -> str:
+        """Parse response according to provider format"""
+        if self.provider == "openai" or self.provider == "lmstudio":
+            # OpenAI format
+            if "choices" in response_data and len(response_data["choices"]) > 0:
+                content = response_data["choices"][0].get("message", {}).get("content", "")
+                # Store usage information if available
+                if "usage" in response_data:
+                    self.last_usage = response_data["usage"]
+                return content
+        elif self.provider == "anthropic":
+            # Anthropic format
+            if "content" in response_data and len(response_data["content"]) > 0:
+                content = response_data["content"][0].get("text", "")
+                # Store usage information if available
+                if "usage" in response_data:
+                    self.last_usage = response_data["usage"]
+                return content
+        elif self.provider == "ollama":
+            # Ollama format
+            if "message" in response_data:
+                content = response_data["message"].get("content", "")
+                # Ollama doesn't provide usage info, so we'll estimate
+                self._estimate_usage(content)
+                return content
+        
+        # Generic fallback
+        if "content" in response_data:
+            return response_data["content"]
+        elif "text" in response_data:
+            return response_data["text"]
+        elif "response" in response_data:
+            return response_data["response"]
+        else:
+            # Last resort: return the whole response as string
+            return str(response_data)
+
+    async def chat_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        stream: bool = False,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Send an OpenAI-style chat completion request. Supports structured content.
+
+        The method intentionally keeps streaming disabled for now; callers can
+        choose to stream responses at a higher layer using the returned content.
+        """
+        payload: Dict[str, Any] = {
+            "model": model or self.model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": stream,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+        endpoint = self._get_endpoint_for_provider()
+        url = urljoin(self.base_url, endpoint)
+
+        response = await self.client.post(url, json=payload, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+
+    async def _chat_completion_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        params: GenerationParams,
+    ) -> ChatResult:
+        """OpenAI-compatible chat completion that forwards tools/tool_choice and
+        returns STRUCTURED tool_calls + the real finish_reason.
+
+        This is the native tool-calling path: the model is given the tool
+        schemas via the ``tools`` param and decides which to call, returning
+        ``finish_reason="tool_calls"`` with a structured ``tool_calls`` array.
+        Assumes an OpenAI-style ``/v1/chat/completions`` endpoint
+        (provider=openai/lmstudio/generic).
+        """
+        payload: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": params.temperature if params.temperature is not None else 0.7,
+            "stream": False,
+            "tools": params.tools,
+        }
+        if params.tool_choice is not None:
+            payload["tool_choice"] = params.tool_choice
+        if params.max_tokens is not None:
+            payload["max_tokens"] = params.max_tokens
+        if params.top_p is not None:
+            payload["top_p"] = params.top_p
+        if params.seed is not None:
+            payload["seed"] = params.seed
+        self._apply_reasoning(payload, params.reasoning_budget)
+
+        endpoint = self._get_endpoint_for_provider()
+        url = urljoin(self.base_url, endpoint)
+        response = await self.client.post(url, json=payload, headers=self.headers)
+        response.raise_for_status()
+        data = response.json()
+
+        choices = data.get("choices") or []
+        message = choices[0].get("message", {}) if choices else {}
+        content = message.get("content") or ""
+        # OpenAI shape: [{"id","type":"function","function":{"name","arguments"}}]
+        tool_calls = message.get("tool_calls")
+        finish_reason = choices[0].get("finish_reason", "stop") if choices else "stop"
+        if "usage" in data:
+            self.last_usage = data["usage"]
+
+        return ChatResult(
+            content=content,
+            usage=self.last_usage,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+        )
+
+    def _estimate_usage(self, content: str):
+        """Estimate token usage when provider doesn't provide it"""
+        # Rough estimation: 1 token ≈ 4 characters
+        estimated_tokens = len(content) // 4
+        self.last_usage = {
+            "prompt_tokens": 0,  # We don't know the prompt tokens
+            "completion_tokens": estimated_tokens,
+            "total_tokens": estimated_tokens
+        }
+    
+    def _apply_reasoning(self, payload: Dict[str, Any], req_budget: Optional[int]) -> None:
+        """Apply the effective thinking/reasoning control to an OpenAI-style payload.
+
+        Precedence: the per-request budget wins, else the slot default from
+        settings (blank → None → leave the server on its own default).
+
+        IMPORTANT (Qwen3.5 on llama-server): the `--reasoning-budget 0` launch flag
+        AND a `reasoning_budget` request field are BOTH ignored by this model — it
+        keeps emitting a <think> block regardless (measured 2026-08-04). The ONLY
+        thing that actually suppresses thinking is the chat template's
+        `enable_thinking` kwarg. So we map budget==0 → enable_thinking=false (the
+        fast voice default) and any other value → enable_thinking=true. We still
+        forward `reasoning_budget` for OpenAI servers that DO honor it (a harmless
+        unknown field where they don't). N>0 (cap) currently degrades to "thinking
+        on, uncapped" — acceptable, our only real use is 0=off for voice.
+        """
+        rb = req_budget if req_budget is not None else self._default_reasoning_budget
+        if rb is None:
+            return
+        payload["chat_template_kwargs"] = {"enable_thinking": rb != 0}
+        payload["reasoning_budget"] = rb
+
+    async def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+        """Chat method with temperature support"""
+        return await self.chat_with_temperature(messages, temperature)
+
+    async def chat_with_temperature(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        reasoning_budget: Optional[int] = None,
+        top_p: Optional[float] = None,
+        seed: Optional[int] = None,
+    ) -> str:
+        """Send chat request with temperature control"""
+        start_time = time.time()
+
+        # Format messages for the provider
+        formatted_data = self._format_messages_for_provider(messages)
+
+        # Add temperature and other parameters
+        if self.request_format == "openai":
+            formatted_data["temperature"] = temperature
+            if max_tokens is not None:
+                formatted_data["max_tokens"] = max_tokens
+            if top_p is not None:
+                formatted_data["top_p"] = top_p
+            if seed is not None:
+                formatted_data["seed"] = seed
+            self._apply_reasoning(formatted_data, reasoning_budget)
+        elif self.request_format == "ollama":
+            formatted_data["options"] = {"temperature": temperature}
+            if max_tokens is not None:
+                formatted_data["options"]["num_predict"] = max_tokens
+        elif self.request_format == "chatml":
+            formatted_data["temperature"] = temperature
+            if max_tokens is not None:
+                formatted_data["max_tokens"] = max_tokens
+        
+        # Get endpoint
+        endpoint = self._get_endpoint_for_provider()
+        url = urljoin(self.base_url, endpoint)
+        
+        logger.debug(f"🌐 Sending request to {url}")
+        logger.debug(f"🌡️  Temperature: {temperature}")
+        logger.debug(f"📝 Provider: {self.provider}")
+        
+        try:
+            # Send request
+            response = await self.client.post(
+                url,
+                json=formatted_data,
+                headers=self.headers
+            )
+            
+            # Check for errors
+            response.raise_for_status()
+            
+            # Parse response
+            response_data = response.json()
+            content = self._parse_response_for_provider(response_data)
+            
+            # Calculate timing
+            end_time = time.time()
+            total_time = end_time - start_time
+            
+            # Print performance metrics
+            if self.last_usage:
+                completion_tokens = self.last_usage.get("completion_tokens", 0)
+                tokens_per_second = completion_tokens / total_time if total_time > 0 else 0
+                logger.debug(f"🚀 Generated {completion_tokens} tokens in {total_time:.2f}s ({tokens_per_second:.1f} tok/s)")
+                logger.debug(f"📊 Usage: {self.last_usage}")
+            else:
+                logger.debug(f"🚀 Generated response in {total_time:.2f}s")
+
+            return content.strip()
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ HTTP error: {e.response.status_code} - {e.response.text}")
+            raise Exception(f"HTTP {e.response.status_code}: {e.response.text}")
+        except httpx.RequestError as e:
+            logger.error(f"❌ Request error: {e}")
+            raise Exception(f"Request failed: {e}")
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ JSON decode error: {e}")
+            raise Exception(f"Invalid JSON response: {e}")
+        except Exception as e:
+            logger.error(f"❌ Unexpected error: {e}")
+            raise Exception(f"Unexpected error: {e}")
+    
+    async def process_context(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Process context without generating a response - for warm-up purposes"""
+        try:
+            # For REST backends, we'll just store the messages
+            # since we can't easily process context without making a request
+            processed_context = {
+                "messages": messages,
+                "context_processed": True,
+                "timestamp": time.time(),
+                "backend": "rest",
+                "provider": self.provider
+            }
+            
+            logger.debug(f"🔥 Context processed for {len(messages)} messages (REST backend)")
+            return processed_context
+
+        except Exception as e:
+            logger.warning(f"⚠️  Error processing context: {e}")
+            return {
+                "messages": messages,
+                "context_processed": False,
+                "timestamp": time.time(),
+                "backend": "rest",
+                "provider": self.provider
+            }
+
+    def generate_text_chat(
+        self,
+        model_cfg: Any,
+        messages: List[NormalizedMessage],
+        params: GenerationParams,
+    ) -> ChatResult:
+        """Generate text response using the REST API.
+
+        Converts NormalizedMessage to dict format and calls chat_with_temperature.
+        Note: This is sync but internally calls async methods via asyncio.
+        """
+
+        # Convert NormalizedMessage to simple dict format
+        dict_messages = []
+        for msg in messages:
+            text_parts = []
+            for part in msg.content:
+                if isinstance(part, TextPart):
+                    text_parts.append(part.text)
+            dict_messages.append({
+                "role": msg.role,
+                "content": " ".join(text_parts)
+            })
+
+        # When native tools are requested, use the tool-aware completion so
+        # structured tool_calls + finish_reason flow back (the native path);
+        # otherwise keep the content-only path (backward compatible).
+        async def _run() -> ChatResult:
+            if params.tools:
+                return await self._chat_completion_with_tools(dict_messages, params)
+            content = await self.chat_with_temperature(
+                dict_messages,
+                params.temperature,
+                max_tokens=params.max_tokens,
+                reasoning_budget=params.reasoning_budget,
+                top_p=params.top_p,
+                seed=params.seed,
+            )
+            return ChatResult(
+                content=content,
+                usage=self.last_usage,
+                tool_calls=None,
+                finish_reason="stop",
+            )
+
+        # Sync bridge. The persistent ``self.client`` (and its connection pool)
+        # binds to the event loop it is first used on, so it MUST always run on
+        # one stable loop. Running a call on a throwaway loop (``asyncio.run``)
+        # poisons the pooled connection for the NEXT call, which then dies with
+        # "RuntimeError: Event loop is closed" during connection cleanup.
+        #
+        # This used to branch on "is there a running loop?" as a proxy for "is
+        # my caller async, and therefore is my client persistent?". That proxy
+        # broke when chat_runner started offloading sync generations with
+        # ``asyncio.to_thread``: inside a worker thread there IS no running
+        # loop, so every model-service call took the throwaway-loop branch and
+        # the REST backend alternated 200/500/200/500 (CI behavior corpus,
+        # 2026-07-20). Bind to the dedicated loop unconditionally instead —
+        # it is correct whatever thread or context the caller runs on, which
+        # the heuristic never was.
+        bg_loop = self._get_background_loop()
+        return asyncio.run_coroutine_threadsafe(_run(), bg_loop).result()
+
+    def _get_background_loop(self) -> asyncio.AbstractEventLoop:
+        """Lazily start (once) a dedicated background event loop on a daemon
+        thread. All async REST work from a sync-bridge-in-async-context call runs
+        here, so the persistent ``self.client`` stays bound to one stable loop
+        for the lifetime of this backend (fixes "Event loop is closed")."""
+        loop = self._bg_loop
+        if loop is not None and not loop.is_closed():
+            return loop
+        with self._bg_loop_lock:
+            loop = self._bg_loop
+            if loop is None or loop.is_closed():
+                loop = asyncio.new_event_loop()
+                thread = threading.Thread(
+                    target=loop.run_forever,
+                    name=f"rest-backend-{self.model_type}-loop",
+                    daemon=True,
+                )
+                thread.start()
+                self._bg_loop = loop
+            return loop
+
+    async def generate_vision_chat(
+        self,
+        model_cfg: Any,
+        messages: List[NormalizedMessage],
+        params: GenerationParams,
+    ) -> ChatResult:
+        """
+        Generate a vision chat response by converting NormalizedMessage to OpenAI format
+        and calling the remote API.
+        
+        This method converts NormalizedMessage (which can contain ImagePart) to the
+        OpenAI-style structured content format expected by remote APIs.
+        """
+        start_time = time.time()
+        
+        # Convert NormalizedMessage to OpenAI-style messages with structured content
+        openai_messages: List[Dict[str, Any]] = []
+        for msg in messages:
+            content_parts: List[Dict[str, Any]] = []
+            
+            for part in msg.content:
+                if isinstance(part, TextPart):
+                    content_parts.append({
+                        "type": "text",
+                        "text": part.text
+                    })
+                elif isinstance(part, ImagePart):
+                    # Convert ImagePart back to data URL format
+                    data_url = part.to_data_url()
+                    image_part: Dict[str, Any] = {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_url
+                        }
+                    }
+                    if part.detail:
+                        image_part["image_url"]["detail"] = part.detail
+                    content_parts.append(image_part)
+            
+            openai_messages.append({
+                "role": msg.role,
+                "content": content_parts
+            })
+        
+        logger.debug(f"🖼️  Sending vision request to {self.provider} with {len(messages)} messages")
+        
+        try:
+            # Use the chat_completion method which supports structured content
+            response_data = await self.chat_completion(
+                messages=openai_messages,
+                temperature=params.temperature or 0.7,
+                max_tokens=params.max_tokens,
+                stream=False,  # For now, no streaming
+                model=self.model_name,
+            )
+            
+            # Parse response
+            content = self._parse_response_for_provider(response_data)
+            
+            # Calculate timing
+            end_time = time.time()
+            total_time = end_time - start_time
+            
+            # Print performance metrics
+            if self.last_usage:
+                completion_tokens = self.last_usage.get("completion_tokens", 0)
+                tokens_per_second = completion_tokens / total_time if total_time > 0 else 0
+                logger.debug(f"🚀 [Vision] Generated {completion_tokens} tokens in {total_time:.2f}s ({tokens_per_second:.1f} tok/s)")
+                logger.debug(f"📊 Usage: {self.last_usage}")
+            else:
+                logger.debug(f"🚀 [Vision] Generated response in {total_time:.2f}s")
+
+            return ChatResult(content=content.strip(), usage=self.last_usage, tool_calls=None, finish_reason="stop")
+
+        except Exception as e:
+            logger.error(f"❌ Error in vision chat: {e}")
+            raise
+    
+    async def unload(self):
+        """Clean up resources"""
+        if hasattr(self, 'client'):
+            await self.client.aclose()
+        logger.info(f"🔄 Unloaded REST backend: {self.provider}")
+    
+    def __del__(self):
+        """Cleanup when object is destroyed"""
+        if hasattr(self, 'client'):
+            # Note: This is not ideal for async cleanup, but it's a fallback
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.client.aclose())
+            except (RuntimeError, AttributeError):
+                pass

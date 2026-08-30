@@ -1,0 +1,57 @@
+version: '3.9'
+
+services:
+  jarvis-whisper:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+      args:
+        WHISPER_CUDA_ARCH: ${WHISPER_CUDA_ARCH:-86}
+    ports:
+      - "${PORT:-7706}:${PORT:-7706}"
+    volumes:
+      - ./app:/app/app
+      - ./.env:/app/.env
+      - ../jarvis-log-client:/app/jarvis-log-client
+      - ../jarvis-config-client:/app/jarvis-config-client
+      - ../jarvis-auth-client:/app/jarvis-auth-client
+      - ../jarvis-settings-client:/app/jarvis-settings-client
+      - ~/whisper.cpp:/root/whisper.cpp:ro
+      - whisper-voice-profiles:/app/voice_profiles
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - JARVIS_VOICE_DEVICE=cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    extra_hosts:
+      - "${DOCKER_HOST_ALIAS:-host.docker.internal}:host-gateway"
+    command: >
+      sh -c "pip install -q -e /app/jarvis-log-client -e /app/jarvis-config-client -e /app/jarvis-auth-client -e /app/jarvis-settings-client &&
+             uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-7706} --reload"
+
+  postgres:
+    profiles: ["standalone"]
+    image: postgres:15
+    environment:
+      POSTGRES_DB: jarvis_whisper
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - whisper-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  whisper-pg-data:
+  whisper-voice-profiles:

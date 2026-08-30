@@ -1,0 +1,58 @@
+{
+  "jarvis-admin": {
+    "dev": "sha256:3172107638c56e4ad420c1f8fefe128e9fc9ea2ede7c855ea8b285d5fd6f4287",
+    "latest": "sha256:ef2d678a9fc21e0fe357321de59d0678ac84bd3168de1d40530b7f4a7f2fcb68"
+  },
+  "jarvis-auth": {
+    "dev": "sha256:112a0863ffe5969fcf3277b7f7a473a3983d1af26601382799ef4e22a72e2a91",
+    "latest": "sha256:88a56d29dace03298a2c65b33d3ff25db63197388dec99aacba3580640c30685"
+  },
+  "jarvis-command-center": {
+    "dev": "sha256:a6af461bd453ff6e1b3aec245bda714a62d38b185276afaf047c813bb9d88f91",
+    "latest": "sha256:73e6b5ceda9755a96c0505a2d0bd903ca17f1bd70dff3e874d617c5662d46b63"
+  },
+  "jarvis-config-service": {
+    "dev": "sha256:ee1e0fc8c714cc01a2ef0ebf4f5ba9658bcd0602189bdab7e3019dc8e9129280",
+    "latest": "sha256:3977f51f105ac0cbb13e52c5b9c74869979e696d945bc7f5310857665dde7880"
+  },
+  "jarvis-llm-proxy-api": {
+    "dev-cpu": "sha256:0c1a8da018de01196930ee3a69a667254582b722e776ac9525f8d1772c3e7edb",
+    "dev-cuda": "sha256:df6fc52ded53d644e9de69ab9ec193f6d801d1ec5f52810b92ad3c49b696e16c",
+    "dev-rocm": "sha256:dc67d5e60ec1d468528fec0a60c267447aa2665005cce29d978f417876059844",
+    "dev-vulkan": "sha256:1efe9f568cf604474092edf3200059bf0d82aab31d18573274bb275921c66761",
+    "latest-cpu": "sha256:ae58cba0a6d2b5b87db81f0ea14b822868f0020c454e33073f26b98694284df9",
+    "latest-cuda": "sha256:2e030f38dac8d2e9914317f22dfaa43d6563fe65312e6cb973005e7b68ae9ceb",
+    "latest-rocm": "sha256:72d1d986933c43004cbe241c755ba8541ac43fb21170fac3a48299a773dc5814",
+    "latest-vulkan": "sha256:77cbe78e484c4bfd1a6fb393155bc3fb7c22ba382e749aac882a2114800a061e"
+  },
+  "jarvis-logs": {
+    "dev": "sha256:7ba4a222b5e4f0135a74f193755f50874947dcac54c22271d29ccb34a93a539a",
+    "latest": "sha256:2791a725cdc14defa884eb575ee00f370b88a30ec16e40cd8f17ef31baac2ea5"
+  },
+  "jarvis-notifications": {
+    "dev": "sha256:55da32e1ecf53b8e173761ad69ca54399c7116f3d9be689d42f10f5464eee9f9",
+    "latest": "sha256:55da32e1ecf53b8e173761ad69ca54399c7116f3d9be689d42f10f5464eee9f9"
+  },
+  "jarvis-settings-server": {
+    "dev": "sha256:63a097be87845e4f36a8f3505f9ad2b30c9febef3aae07ad58b3529a16592dea",
+    "latest": "sha256:33d3667eafae0be3dd66100301655eb9c516198fcf89d005ad2cc0f8b47b9102"
+  },
+  "jarvis-tts": {
+    "dev": "sha256:78b01da7a726d7559c95b0e3f33e53a466c79ca4a8e623e5231ec4f93b7273f6",
+    "latest": "sha256:01318803ae64669acd17b44d0da07651b45efc7ba2a3e6db9896d60d98313de2"
+  },
+  "jarvis-web": {
+    "dev": "sha256:dc6e961b9983388336ddb2321498d1300ad4c154f92d19a0f560b4386ce1dc86",
+    "latest": "sha256:dc6e961b9983388336ddb2321498d1300ad4c154f92d19a0f560b4386ce1dc86"
+  },
+  "jarvis-whisper-api": {
+    "dev": "sha256:ad4aa48c470b34cfbe53d38b6786f438dd690e0f58044fd131e3bed4ebc67a09",
+    "dev-cuda": "sha256:effbd1452809e891d612ac83e61f02bc41760c81916adc22ced8fedcf683ab5b",
+    "dev-rocm": "sha256:e11c8a36fdd38be7f080da2d74fcffd5e02ed9da33de4ded8154d784beb9de59",
+    "dev-vulkan": "sha256:1cf4a8afd79df7c2a86037bdc75c72623bd49d5f87e79e1128a2b1f590d821c5",
+    "latest": "sha256:dfcd8f5283e19374017334b85a8910b099870117b8f5eac19fd5ee8deb527418",
+    "latest-cuda": "sha256:e69586f2b6ca1fe3755750de98cdf3cdd068230b71e9a85791956cc13e2e859d",
+    "latest-rocm": "sha256:e76205388aa6700bbb498df08c0f153312364555377e3feee09a9b29a28cd082",
+    "latest-vulkan": "sha256:10cb1375bb1898b98777c44efb0e996e23db909168cee7e5bd8b8123eae36805"
+  }
+}

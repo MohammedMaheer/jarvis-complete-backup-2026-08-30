@@ -1,0 +1,93 @@
+from pydantic import BaseModel
+from typing import Optional, Dict, List, Any
+from enum import Enum
+
+
+class StopReason(str, Enum):
+    """Reason why the LLM stopped generating."""
+    COMPLETE = "complete"
+    TOOL_CALLS = "tool_calls"
+    VALIDATION_REQUIRED = "validation_required"
+    ERROR = "error"
+    NOT_FOR_ME = "not_for_me"
+
+
+class VoiceCommandError(BaseModel):
+    type: str
+    message: str
+    missing_parameters: Optional[List[str]] = None
+    suggestions: Optional[List[str]] = None
+    clarification_question: Optional[str] = None
+
+
+class SingleCommandResponse(BaseModel):
+    """Response for a single command"""
+    success: bool
+    command_name: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    errors: Optional[VoiceCommandError] = None
+
+
+class RequestInformation(BaseModel):
+    """Information about the original request"""
+    voice_command: str
+    conversation_id: Optional[str] = None
+
+
+class ToolCall(BaseModel):
+    """A tool call requested by the LLM."""
+    id: str
+    type: str = "function"
+    function: Dict[str, Any]
+    failure_message: Optional[str] = None
+
+
+class ValidationRequest(BaseModel):
+    """Validation/clarification request from the server (stub for future implementation)."""
+    question: str
+    parameter_name: str
+    options: Optional[List[str]] = None
+    tool_call_id: Optional[str] = None
+
+
+class VoiceCommandResponse(BaseModel):
+    """Response that can contain one or multiple commands"""
+    commands: List[SingleCommandResponse]
+    request_information: Optional[RequestInformation] = None
+
+    # New fields for tool-based architecture
+    stop_reason: Optional[StopReason] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    validation_request: Optional[ValidationRequest] = None
+    assistant_message: Optional[str] = None
+    reasoning: Optional[str] = None
+    # The model marked this reply as terminal (<exchange_complete/> was
+    # stripped from assistant_message). The node skips its follow-up
+    # window and returns to idle. None/False → normal window behavior.
+    end_of_exchange: Optional[bool] = None
+    # FOLLOW-UP (not yet a field — documented so the wire shape is decided
+    # deliberately, not forced from CC): the node arms its not_for_me soft
+    # cooldown purely node-side when stop_reason == "not_for_me" (node
+    # core/wake_loop.py → voice_filters.arm_not_for_me_cooldown). A verdict
+    # on a SELF-PLAYBACK turn (node was playing its own music at wake)
+    # should not escalate that cooldown as aggressively — music turns are a
+    # different false-wake population and the user is likely to re-wake to
+    # control the music. When the node grows handling for it, add e.g.
+    #   not_for_me_context: Optional[str] = None  # "self_playback_media"
+    # here and tag it where the sentinel is converted in
+    # core/conversation_handler.py (search: "node cooldown interplay").
+    
+    @property
+    def success(self) -> bool:
+        """Returns True if all commands succeeded"""
+        return all(cmd.success for cmd in self.commands)
+    
+    @property
+    def has_errors(self) -> bool:
+        """Returns True if any command has errors"""
+        return any(cmd.errors is not None for cmd in self.commands)
+    
+    @property
+    def errors(self) -> List[VoiceCommandError]:
+        """Returns all errors from all commands"""
+        return [cmd.errors for cmd in self.commands if cmd.errors is not None] 

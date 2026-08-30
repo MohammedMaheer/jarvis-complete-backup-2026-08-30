@@ -1,0 +1,381 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Build standalone binaries for 3 platforms
+  build-binaries:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14           # Apple Silicon runner
+            target: darwin-arm64
+            artifact: jarvis-admin-darwin-arm64
+          - os: ubuntu-latest
+            target: linux-x64
+            artifact: jarvis-admin-linux-x64
+          - os: ubuntu-latest
+            target: linux-arm64
+            artifact: jarvis-admin-linux-arm64
+          - os: windows-latest
+            target: windows-x64
+            artifact: jarvis-admin-windows-x64.exe
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm ci --prefix server
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build server
+        run: npx tsc
+        working-directory: server
+
+      - name: Prepare bundle directory
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p bundle/server/dist
+          mkdir -p bundle/server/src/data
+          mkdir -p bundle/public
+
+          # Server compiled output
+          cp -r server/dist/* bundle/server/dist/
+
+          # Server dependencies
+          cp server/package.json bundle/server/
+          cp server/package-lock.json bundle/server/
+          cd bundle/server && npm ci --omit=dev && cd ../..
+
+          # Service registry data (imported by install routes)
+          cp server/src/data/service-registry.json bundle/server/src/data/
+
+          # Frontend build
+          cp -r dist/* bundle/public/
+
+      - name: Prepare bundle directory (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bundle/server/dist, bundle/server/src/data
+
+          Copy-Item -Recurse server/dist/* bundle/server/dist/
+          Copy-Item server/package.json bundle/server/
+          Copy-Item server/package-lock.json bundle/server/
+
+          Push-Location bundle/server
+          npm ci --omit=dev
+          Pop-Location
+
+          Copy-Item server/src/data/service-registry.json bundle/server/src/data/
+          Copy-Item -Recurse dist bundle/public
+
+      - name: Create standalone binary
+        if: runner.os != 'Windows'
+        run: |
+          cd bundle
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Create entry point that sets STATIC_DIR and JARVIS_VERSION
+          cat > entry.ts << ENTRY
+          import { join, resolve } from 'node:path'
+          import { existsSync } from 'node:fs'
+
+          // Inject platform version at compile time
+          process.env.JARVIS_VERSION = '${VERSION}'
+
+          // process.execPath gives the real binary path in bun-compiled binaries
+          const binaryDir = join(process.execPath, '..')
+          const publicDir = join(binaryDir, 'public')
+          if (existsSync(publicDir)) {
+            process.env.STATIC_DIR = resolve(publicDir)
+          }
+
+          await import('./server/dist/index.js')
+          ENTRY
+
+          bun build entry.ts \
+            --compile \
+            --target=bun-${{ matrix.target == 'darwin-arm64' && 'darwin-arm64' || matrix.target == 'linux-x64' && 'linux-x64' || 'linux-arm64' }} \
+            --outfile ${{ matrix.artifact }}
+
+      - name: Create standalone binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Location bundle
+          $Version = "${{ github.ref_name }}".TrimStart('v')
+
+          @"
+          import { join, resolve } from 'node:path'
+          import { existsSync } from 'node:fs'
+
+          process.env.JARVIS_VERSION = '$Version'
+
+          const binaryDir = join(process.execPath, '..')
+          const publicDir = join(binaryDir, 'public')
+          if (existsSync(publicDir)) {
+            process.env.STATIC_DIR = resolve(publicDir)
+          }
+
+          await import('./server/dist/index.js')
+          "@ | Set-Content entry.ts
+
+          bun build entry.ts --compile --target=bun-windows-x64 --outfile ${{ matrix.artifact }}
+
+      - name: Verify binary (native only)
+        if: matrix.target == 'darwin-arm64' || matrix.target == 'linux-x64'
+        run: |
+          chmod +x bundle/${{ matrix.artifact }}
+          timeout 5 bundle/${{ matrix.artifact }} || true
+          echo "Binary created successfully"
+
+      - name: Verify binary (Windows)
+        if: matrix.target == 'windows-x64'
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "bundle/${{ matrix.artifact }}" -PassThru
+          Start-Sleep -Seconds 5
+          if (!$proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          Write-Host "Binary created successfully"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: bundle/${{ matrix.artifact }}
+
+      - name: Upload public assets (once)
+        if: matrix.target == 'linux-x64'
+        run: tar czf public.tar.gz -C bundle public
+      - uses: actions/upload-artifact@v7
+        if: matrix.target == 'linux-x64'
+        with:
+          name: public-assets
+          path: public.tar.gz
+
+  # Create GitHub Release with binaries
+  release:
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: binaries
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for dir in binaries/*/; do
+            name=$(basename "$dir")
+            # Skip non-binary dirs (public-assets)
+            [[ -f "$dir/$name" ]] && cp "$dir/$name" "release/$name" && chmod +x "release/$name"
+          done
+
+          # Copy public assets tarball
+          cp binaries/public-assets/public.tar.gz release/ 2>/dev/null || true
+
+          # Create checksums
+          cd release
+          sha256sum * > checksums.txt
+
+      - name: Sign checksums (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          # Best-effort: signing must NEVER block a release (phase 1 — no client
+          # verifies yet). Any failure warns and the release ships UNSIGNED.
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::warning::MINISIGN_SECRET_KEY not set — release will be UNSIGNED"
+            exit 0
+          fi
+          if ! { sudo apt-get update && sudo apt-get install -y minisign; }; then
+            echo "::warning::could not install minisign — release will be UNSIGNED"
+            exit 0
+          fi
+          umask 077
+          key="$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          # minisign reads the password from stdin when not a TTY.
+          if printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$key" -m release/checksums.txt && [ -f release/checksums.txt.minisig ]; then
+            echo "Signed checksums.txt -> checksums.txt.minisig"
+          else
+            echo "::warning::minisign signing failed — release will be UNSIGNED"
+          fi
+          shred -u "$key" 2>/dev/null || rm -f "$key"
+          exit 0
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          generate_release_notes: true
+          files: |
+            release/*
+          body: |
+            ## Install
+
+            **One-liner:**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            **npx (requires Node.js):**
+            ```bash
+            npx @alexberardi/jarvis-admin
+            ```
+
+            **Manual download:**
+            | Platform | Binary |
+            |----------|--------|
+            | macOS (Apple Silicon) | `jarvis-admin-darwin-arm64` |
+            | Linux (x86_64) | `jarvis-admin-linux-x64` |
+            | Linux (ARM64 / Pi 5) | `jarvis-admin-linux-arm64` |
+            | Windows (x86_64) | `jarvis-admin-windows-x64.exe` |
+
+            **macOS / Linux:**
+            ```bash
+            chmod +x jarvis-admin-*
+            ./jarvis-admin-*
+            # Open http://localhost:7711
+            ```
+
+            **Windows (PowerShell):**
+            ```powershell
+            .\jarvis-admin-windows-x64.exe
+            # Open http://localhost:7711
+            ```
+
+  # Publish to npm
+  publish-npm:
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm ci --prefix server
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build server
+        run: npx tsc
+        working-directory: server
+
+      - name: Prepare npm package
+        run: |
+          mkdir -p npm-pkg/server/dist
+          mkdir -p npm-pkg/server/src/data
+          mkdir -p npm-pkg/public
+          mkdir -p npm-pkg/bin
+
+          # Server (dereference links)
+          cp -rL server/dist/* npm-pkg/server/dist/
+          cp server/package.json npm-pkg/server/
+          cp server/package-lock.json npm-pkg/server/
+          cp server/src/data/service-registry.json npm-pkg/server/src/data/
+
+          # Frontend
+          cp -rL dist/* npm-pkg/public/
+
+          # CLI entry
+          cp bin/jarvis-admin.mjs npm-pkg/bin/
+
+          # Package metadata — set version from git tag
+          cp npm-package.json npm-pkg/package.json
+          VERSION="${GITHUB_REF_NAME#v}"
+          cd npm-pkg && npm version "$VERSION" --no-git-tag-version && cd ..
+          cp README.md npm-pkg/ 2>/dev/null || true
+
+      - name: Install server production deps
+        run: cd npm-pkg/server && npm install --omit=dev
+
+      - name: Break hard links
+        run: |
+          cd npm-pkg
+          find . -type f -links +1 | while read f; do
+            tmp="$(mktemp)"
+            cp "$f" "$tmp"
+            mv "$tmp" "$f"
+          done
+
+      - name: Publish to npm
+        run: cd npm-pkg && npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Also build Docker image on release
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            JARVIS_VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

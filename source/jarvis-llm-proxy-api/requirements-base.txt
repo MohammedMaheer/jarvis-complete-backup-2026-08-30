@@ -1,0 +1,65 @@
+# Base requirements for Jarvis LLM Proxy API
+# These are installed on all platforms
+
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+sentencepiece==0.2.2
+debugpy
+Pillow
+num2words
+Pillow
+redis>=8.0.1
+rq>=1.15.1
+psutil>=7.2.2  # For process management (vLLM cleanup)
+sqlalchemy>=2.0.23
+alembic>=1.12.1
+psycopg2-binary>=2.9.9
+boto3>=1.34.0  # S3/MinIO adapter storage
+
+# torch is pinned by vLLM's own dependencies when using the vllm backend.
+# For non-vLLM setups (GGUF, transformers-only), install torch separately.
+torch>=2.13.0
+
+# Adapter training (always uses transformers + PEFT regardless of inference backend)
+transformers>=4.30.0
+peft>=0.12.0
+datasets>=2.14.0
+trl>=0.7.0
+accelerate>=1.14.0
+bitsandbytes>=0.50.0  # Required for 4-bit quantized training
+# huggingface-hub: mlx-lm requires >=1.0 (via transformers 5.x)
+huggingface-hub>=0.34.0
+# FastText for date key extraction (use wheel to avoid compilation issues)
+fasttext-wheel>=0.9.2
+
+# jarvis-log-client installed from local mount at runtime
+# (provides centralized logging to jarvis-logs server)
+
+# jarvis-config-client for service discovery
+jarvis-config-client @ git+https://github.com/alexberardi/jarvis-config-client.git@fea99b556e2ac09a67101bd5e18af1dd4c923e4f
+
+# jarvis-settings-client for settings management
+jarvis-settings-client @ git+https://github.com/alexberardi/jarvis-settings-client.git@9902feb
+
+# Required for GGUF conversion (vendored llama.cpp convert_hf_to_gguf.py / convert_lora_to_gguf.py)
+gguf>=0.19.0
+mistral_common>=1.0.0  # Unconditional import in vendored convert_hf_to_gguf.py
+
+# Embeddings (CPU-based, independent of chat model backend)
+# >=5.7: the floor matters on BOTH sides —
+#  - <5.4 breaks against transformers 5.x (CrossEncoder imports
+#    AutoModelForSequenceClassification, removed in transformers 5; and vllm
+#    >=0.27 forces transformers 5 into the image). 2026-08-15 prod: /v1/embeddings
+#    500'd and killed CC memory recall's vector search + the embedding sweep.
+#  - 5.4.0–5.6.x hard-import torchcodec, which needs FFmpeg shared libs our
+#    images don't ship (2026-07-27 prod, bisected live: same 500 failure mode).
+# 5.7.0 verified clean-importing with transformers 5.15 and NO ffmpeg
+# (python:3.11-slim, 2026-08-15). Keep the floor at a verified version.
+sentence-transformers>=5.7.0
+
+# Platform-specific ML libraries are installed separately:
+# - llama-cpp-python 0.3.16 (built against llama.cpp commit 4227c9b)
+# - mlx-lm (macOS only)
+# - vllm (optional, high-performance inference)

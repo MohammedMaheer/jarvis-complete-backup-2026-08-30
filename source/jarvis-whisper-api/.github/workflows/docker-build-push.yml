@@ -1,0 +1,139 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            suffix: ""
+            platforms: linux/amd64,linux/arm64
+            cache_scope: cpu
+          - dockerfile: Dockerfile.gpu
+            suffix: "-cuda"
+            platforms: linux/amd64
+            cache_scope: cuda
+          - dockerfile: Dockerfile.rocm
+            suffix: "-rocm"
+            platforms: linux/amd64
+            cache_scope: rocm
+          - dockerfile: Dockerfile.vulkan
+            suffix: "-vulkan"
+            platforms: linux/amd64
+            cache_scope: vulkan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # The ROCm variant pulls a 5 GB torch wheel on top of a ~10 GB rocm-complete
+      # base image. Default GHA ubuntu runners (~14 GB free after stock tools)
+      # OOM during pip install. jlumbroso/free-disk-space frees ~30 GB more.
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # suffix is appended to every generated tag (e.g. latest, dev, v0.1.5),
+          # giving us latest-cuda / latest-rocm alongside the CPU latest.
+          # onlatest=true forces the suffix onto the literal "latest" tag too.
+          flavor: |
+            suffix=${{ matrix.suffix }},onlatest=true
+          tags: |
+            # Tag as 'dev' on push to main
+            type=raw,value=dev,enable={{is_default_branch}}
+            # Tag with version on tag push (e.g., v1.0.0 -> 1.0.0)
+            type=semver,pattern={{version}}
+            # Tag with major.minor on tag push (e.g., v1.0.0 -> 1.0)
+            type=semver,pattern={{major}}.{{minor}}
+            # Tag as 'latest' on tag push
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Per-variant cache scope so CPU/CUDA/ROCm builds don't trample each
+          # other's layers. Skip cache-from on tag pushes to avoid stale layers.
+          cache-from: ${{ !startsWith(github.ref, 'refs/tags/') && format('type=gha,scope={0}', matrix.cache_scope) || '' }}
+          # ignore-error: a cache-export failure must NOT fail a successful
+          # build+push. The ROCm image is large enough that its mode=max cache
+          # blows past the 10GB GHA-cache limit and the export dies with
+          # `not_found` (2026-07-24) — after the image had already pushed to
+          # GHCR. The cache is only a build-time speedup; losing it is fine,
+          # failing the publish is not.
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }},ignore-error=true
+
+      - name: Output image tags
+        run: |
+          echo "### Docker Image Published — ${{ matrix.dockerfile }} 🐳" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ github.ref }}" == refs/heads/main ]]; then
+            echo "✨ This is a **dev** build from main branch" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Pull with:" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev${{ matrix.suffix }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "🚀 This is a **production** release" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Pull with:" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest${{ matrix.suffix }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi

@@ -1,0 +1,135 @@
+# ============================================================================
+# Jarvis LLM Proxy API - Dockerfile.vulkan (AMD GPU via Vulkan)
+# ============================================================================
+# For AMD GPUs (RDNA2 through RDNA4). Uses llama-cpp-python compiled with the
+# Vulkan backend. Runtime ships Mesa 25.x (kisak PPA) so RADV supports RDNA4 /
+# gfx1201 (RX 9070/9070 XT); stock Ubuntu Mesa predates RDNA4.
+# Requires --device /dev/dri passthrough in docker-compose.
+#
+# Build:  docker build -f Dockerfile.vulkan -t jarvis-llm-proxy-api:vulkan .
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Builder
+# ---------------------------------------------------------------------------
+# Pinned by digest (see Dockerfile for rationale). Refresh deliberately:
+#   docker buildx imagetools inspect ubuntu:22.04
+FROM ubuntu:22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Add LunarG Vulkan SDK repo first — Ubuntu 22.04's Vulkan headers (1.3.204)
+# are too old for current llama.cpp (needs PipelineRobustnessCreateInfoEXT etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates wget \
+    && wget -qO /etc/apt/trusted.gpg.d/lunarg.asc https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+    && wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    python3-pip \
+    cmake \
+    build-essential \
+    libvulkan-dev \
+    vulkan-headers \
+    glslang-tools \
+    spirv-headers \
+    shaderc \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+WORKDIR /build
+
+# Base requirements (no vLLM — it requires CUDA)
+COPY requirements-base.txt .
+RUN pip install --no-cache-dir -r requirements-base.txt
+
+# Build llama-cpp-python with the Vulkan backend (GGML_VULKAN is the current flag)
+ENV CMAKE_ARGS="-DGGML_VULKAN=on"
+RUN pip install --no-cache-dir "llama-cpp-python==0.3.16" --no-binary llama-cpp-python
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime
+# ---------------------------------------------------------------------------
+# Runtime is Ubuntu 24.04 (noble), NOT 22.04: RADV RDNA4/gfx1201 support needs
+# Mesa 25.x and the kisak-mesa fresh PPA dropped 22.04. Refresh deliberately:
+#   docker buildx imagetools inspect ubuntu:24.04
+FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# python3.11 via deadsnakes (noble ships 3.12; the builder produces cp311 wheels)
+# + Mesa 25.x via kisak-mesa for RADV RDNA4/gfx1201 (stock noble Mesa predates it).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates gnupg software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && add-apt-repository -y ppa:kisak/kisak-mesa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 \
+        python3.11-venv \
+        libgomp1 \
+        curl \
+        mesa-vulkan-drivers \
+        libvulkan1 \
+        vulkan-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+
+# The compose passes group_add: [video, render] for GPU /dev/dri access; Ubuntu's
+# minimal base has `video` but NOT `render`, so create it — otherwise the container
+# fails to start with "unable to find group render".
+RUN groupadd -f render && groupadd -f video
+
+COPY --from=builder /usr/local/lib/python3.11/dist-packages /usr/local/lib/python3.11/dist-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+WORKDIR /app
+
+COPY api/ ./api/
+COPY auth/ ./auth/
+COPY backends/ ./backends/
+COPY cache/ ./cache/
+COPY config/ ./config/
+COPY db/ ./db/
+COPY managers/ ./managers/
+COPY models/ ./models/
+COPY queues/ ./queues/
+COPY scripts/ ./scripts/
+COPY services/ ./services/
+COPY storage/ ./storage/
+COPY alembic/ ./alembic/
+COPY alembic.ini .
+COPY main.py .
+# version.py is read by api/health_routes.py to report the running version on
+# /health. The root .py files are copied EXPLICITLY here, so a new one must be
+# added or the container dies at import: ModuleNotFoundError: No module named
+# 'version' (caught by install-e2e, 2026-07-14).
+COPY version.py .
+COPY gpu_select.py .
+COPY pyproject.toml .
+
+RUN mkdir -p /app/.models /app/logs /tmp/jarvis-adapters
+
+EXPOSE 7704 7705
+
+# Default: supervised launcher (alembic migrations, then API in foreground +
+# auto-respawning model service). Compose services typically override this
+# with their own command; serve.sh is the migration target for those compose
+# commands (it replaces the unsupervised `uvicorn model_service & exec uvicorn
+# main` pattern). serve.sh runs `alembic upgrade head` itself (RUN_MIGRATIONS
+# defaults true), so export-style compose commands that currently inline
+# `alembic upgrade head && ...` can drop their command without silently
+# losing migrations.
+CMD ["bash", "scripts/serve.sh"]

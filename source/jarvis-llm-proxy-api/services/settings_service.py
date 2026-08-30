@@ -1,0 +1,1079 @@
+"""Settings service for jarvis-llm-proxy-api.
+
+This module provides the settings service using the shared jarvis-settings-client library.
+It defines LLM-proxy-specific settings and provides convenience methods for accessing
+model and inference configurations.
+"""
+
+import logging
+from pathlib import Path
+
+from jarvis_settings_client import SettingDefinition, SettingsService
+
+logger = logging.getLogger("uvicorn")
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Settings whose dropdown options are the models installed on disk. These hold a
+# model path (or HuggingFace ID); the options are a convenience that mirrors the
+# PromptProvider (llm.interface) dynamic-options pattern. The settings editor always
+# allows a free-text "Other..." value, so HF IDs and not-yet-downloaded paths remain
+# usable even when a setting carries options.
+MODEL_PATH_SETTING_KEYS: frozenset[str] = frozenset(
+    {"model.live.name", "model.background.name", "model.main.name"}
+)
+
+
+def discover_installed_model_paths() -> list[str]:
+    """Scan the .models/ directory and return relative ``.models/<name>`` paths for
+    installed models — GGUF files and model directories (MLX / merged / base HF).
+
+    These populate the dropdown options for the ``model.*.name`` settings. Returns an
+    empty list if the directory is missing or unreadable, in which case those settings
+    fall back to a plain free-text input.
+    """
+    models_dir = _PROJECT_ROOT / ".models"
+    paths: list[str] = []
+    try:
+        if not models_dir.is_dir():
+            return []
+        for item in sorted(models_dir.iterdir()):
+            if item.name.startswith("."):
+                continue
+            if item.is_file() and item.suffix == ".gguf":
+                paths.append(f".models/{item.name}")
+            elif item.is_dir():
+                paths.append(f".models/{item.name}")
+    except OSError:
+        logger.warning("Could not scan .models for model-path options", exc_info=True)
+        return []
+    return paths
+
+
+# All settings definitions with their categories, types, and env fallbacks
+SETTINGS_DEFINITIONS: list[SettingDefinition] = [
+    # ==================== model.live ====================
+    SettingDefinition(
+        key="model.live.name",
+        category="model.live",
+        value_type="string",
+        default="",
+        description="Live model path or HuggingFace ID (falls back to model.main.name)",
+        env_fallback="JARVIS_LIVE_MODEL_NAME",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.live.backend",
+        category="model.live",
+        value_type="string",
+        default="",
+        description="Live model backend (falls back to model.main.backend)",
+        env_fallback="JARVIS_LIVE_MODEL_BACKEND",
+        requires_reload=True,
+        options=["GGUF", "MLX", "VLLM", "TRANSFORMERS", "REST"],
+    ),
+    SettingDefinition(
+        key="model.live.chat_format",
+        category="model.live",
+        value_type="string",
+        default="",
+        description="Live model chat format (falls back to model.main.chat_format)",
+        env_fallback="JARVIS_LIVE_MODEL_CHAT_FORMAT",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.live.context_window",
+        category="model.live",
+        value_type="int",
+        default=0,
+        description="Live model context window (falls back to model.main.context_window)",
+        env_fallback="JARVIS_LIVE_MODEL_CONTEXT_WINDOW",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.live.stop_tokens",
+        category="model.live",
+        value_type="string",
+        default="",
+        description="Live model stop tokens (falls back to model.main.stop_tokens)",
+        env_fallback="JARVIS_LIVE_MODEL_STOP_TOKENS",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.live.rest_url",
+        category="model.live",
+        value_type="string",
+        default="",
+        description="REST URL for live model backend (falls back to model.main.rest_url)",
+        env_fallback="JARVIS_LIVE_REST_MODEL_URL",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.live.reasoning_budget",
+        category="model.live",
+        value_type="string",
+        default="",
+        description=(
+            "Thinking token budget for the LIVE model on a reasoning-capable "
+            "backend (e.g. Qwen3.5 via llama-server/REST): 0 = off (fast voice), "
+            "-1 = unrestricted, N = cap. Blank falls back to "
+            "model.main.reasoning_budget, then the server's own --reasoning-budget. "
+            "A request may override it per-turn."
+        ),
+        env_fallback="JARVIS_LIVE_REASONING_BUDGET",
+        requires_reload=True,
+    ),
+    # ==================== model.background ====================
+    SettingDefinition(
+        key="model.background.name",
+        category="model.background",
+        value_type="string",
+        default="",
+        description="Background model path (empty shares live model)",
+        env_fallback="JARVIS_BACKGROUND_MODEL_NAME",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.background.backend",
+        category="model.background",
+        value_type="string",
+        default="",
+        description="Background model backend (falls back to live backend)",
+        env_fallback="JARVIS_BACKGROUND_MODEL_BACKEND",
+        requires_reload=True,
+        options=["GGUF", "MLX", "VLLM", "TRANSFORMERS", "REST"],
+    ),
+    SettingDefinition(
+        key="model.background.chat_format",
+        category="model.background",
+        value_type="string",
+        default="",
+        description="Background model chat format (falls back to live)",
+        env_fallback="JARVIS_BACKGROUND_MODEL_CHAT_FORMAT",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.background.context_window",
+        category="model.background",
+        value_type="int",
+        default=0,
+        description="Background model context window (falls back to live)",
+        env_fallback="JARVIS_BACKGROUND_MODEL_CONTEXT_WINDOW",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.background.stop_tokens",
+        category="model.background",
+        value_type="string",
+        default="",
+        description="Background model stop tokens (falls back to live)",
+        env_fallback="JARVIS_BACKGROUND_MODEL_STOP_TOKENS",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.background.rest_url",
+        category="model.background",
+        value_type="string",
+        default="",
+        description="REST URL for background model backend (falls back to live)",
+        env_fallback="JARVIS_BACKGROUND_REST_MODEL_URL",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.background.rest_model_name",
+        category="model.background",
+        value_type="string",
+        default="",
+        description="Model name sent to the background REST backend (overrides model.background.name in requests)",
+        env_fallback="JARVIS_REST_BACKGROUND_MODEL_NAME",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.background.reasoning_budget",
+        category="model.background",
+        value_type="string",
+        default="",
+        description=(
+            "Thinking token budget for the BACKGROUND model on a reasoning-capable "
+            "backend: 0 = off, -1 = unrestricted, N = cap. Blank falls back to "
+            "model.main.reasoning_budget, then the server's own --reasoning-budget. "
+            "A queue job may override it per-job via reasoning_budget."
+        ),
+        env_fallback="JARVIS_BACKGROUND_REASONING_BUDGET",
+        requires_reload=True,
+    ),
+    # ==================== model.main (legacy, used as fallback) ====================
+    SettingDefinition(
+        key="model.main.name",
+        category="model.main",
+        value_type="string",
+        default=".models/llama-3.1-8b-instruct-jarvis-Q4_K_M.gguf",
+        description="Main model path or HuggingFace ID (legacy, fallback for model.live)",
+        env_fallback="JARVIS_MODEL_NAME",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.main.backend",
+        category="model.main",
+        value_type="string",
+        default="GGUF",
+        description="Main model backend (legacy, fallback for model.live)",
+        env_fallback="JARVIS_MODEL_BACKEND",
+        requires_reload=True,
+        options=["GGUF", "MLX", "VLLM", "TRANSFORMERS", "REST"],
+    ),
+    SettingDefinition(
+        key="model.main.chat_format",
+        category="model.main",
+        value_type="string",
+        default="llama3",
+        description="Chat template format (legacy, fallback for model.live)",
+        env_fallback="JARVIS_MODEL_CHAT_FORMAT",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.main.context_window",
+        category="model.main",
+        value_type="int",
+        default=8192,
+        description="Maximum context window (legacy, fallback for model.live)",
+        env_fallback="JARVIS_MODEL_CONTEXT_WINDOW",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.main.stop_tokens",
+        category="model.main",
+        value_type="string",
+        default="",
+        description="Comma-separated stop tokens (legacy, fallback for model.live)",
+        env_fallback="JARVIS_MODEL_STOP_TOKENS",
+        requires_reload=True,
+    ),
+    # ==================== inference.vllm ====================
+    SettingDefinition(
+        key="inference.vllm.gpu_memory_utilization",
+        category="inference.vllm",
+        value_type="float",
+        default=0.9,
+        description="GPU memory utilization (0.0-1.0)",
+        env_fallback="JARVIS_VLLM_GPU_MEMORY_UTILIZATION",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.vllm.tensor_parallel_size",
+        category="inference.vllm",
+        value_type="int",
+        default=1,
+        description="Number of GPUs for tensor parallelism",
+        env_fallback="JARVIS_VLLM_TENSOR_PARALLEL_SIZE",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.vllm.max_batched_tokens",
+        category="inference.vllm",
+        value_type="int",
+        default=8192,
+        description="Maximum batched tokens for vLLM",
+        env_fallback="JARVIS_VLLM_MAX_BATCHED_TOKENS",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.vllm.max_num_seqs",
+        category="inference.vllm",
+        value_type="int",
+        default=256,
+        description="Maximum number of sequences",
+        env_fallback="JARVIS_VLLM_MAX_NUM_SEQS",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.vllm.quantization",
+        category="inference.vllm",
+        value_type="string",
+        default="",
+        description="vLLM quantization method",
+        env_fallback="JARVIS_VLLM_QUANTIZATION",
+        requires_reload=True,
+        options=["", "awq", "gptq", "fp8"],
+    ),
+    SettingDefinition(
+        key="inference.vllm.max_lora_rank",
+        category="inference.vllm",
+        value_type="int",
+        default=64,
+        description="Maximum LoRA rank for adapters",
+        env_fallback="JARVIS_VLLM_MAX_LORA_RANK",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.vllm.max_loras",
+        category="inference.vllm",
+        value_type="int",
+        default=1,
+        description="Maximum concurrent LoRA adapters",
+        env_fallback="JARVIS_VLLM_MAX_LORAS",
+        requires_reload=True,
+    ),
+    # ==================== inference.gguf ====================
+    SettingDefinition(
+        key="inference.gguf.n_gpu_layers",
+        category="inference.gguf",
+        value_type="int",
+        default=-1,
+        description="GPU layers (-1=all, 0=CPU only)",
+        env_fallback="JARVIS_N_GPU_LAYERS",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.gguf.split_mode",
+        category="inference.gguf",
+        value_type="int",
+        default=-1,
+        description="Multi-GPU split: -1=auto (recommended: splits layers across GPUs when 2+ capable NVIDIA GPUs are visible — identical cards, or mixed cards all >=8GB; single-GPU otherwise), 0=single GPU (main_gpu only), 1=split layers across GPUs, 2=split rows.",
+        env_fallback="JARVIS_GGUF_SPLIT_MODE",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.gguf.main_gpu",
+        category="inference.gguf",
+        value_type="int",
+        default=0,
+        description="GPU index to use (with split_mode=0) or for scratch/small tensors (when splitting)",
+        env_fallback="JARVIS_GGUF_MAIN_GPU",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.gguf.tensor_split",
+        category="inference.gguf",
+        value_type="string",
+        default="",
+        description="Comma-separated VRAM proportions per GPU for multi-GPU split (e.g. '0.5,0.5'). Requires split_mode>=1.",
+        env_fallback="JARVIS_GGUF_TENSOR_SPLIT",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.gguf.n_batch",
+        category="inference.gguf",
+        value_type="int",
+        default=512,
+        description="Batch size for llama.cpp",
+        env_fallback="JARVIS_N_BATCH",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.gguf.n_ubatch",
+        category="inference.gguf",
+        value_type="int",
+        default=512,
+        description="Micro-batch size",
+        env_fallback="JARVIS_N_UBATCH",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.gguf.n_threads",
+        category="inference.gguf",
+        value_type="int",
+        default=10,
+        description="Number of CPU threads",
+        env_fallback="JARVIS_N_THREADS",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.gguf.flash_attn",
+        category="inference.gguf",
+        value_type="bool",
+        default=True,
+        description="Enable flash attention",
+        env_fallback="JARVIS_FLASH_ATTN",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.gguf.f16_kv",
+        category="inference.gguf",
+        value_type="bool",
+        default=True,
+        description="Use FP16 for KV cache",
+        env_fallback="JARVIS_F16_KV",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.gguf.mul_mat_q",
+        category="inference.gguf",
+        value_type="bool",
+        default=True,
+        description="Enable quantized matrix multiplication",
+        env_fallback="JARVIS_MUL_MAT_Q",
+        requires_reload=True,
+    ),
+    # ==================== inference.transformers ====================
+    SettingDefinition(
+        key="inference.transformers.device",
+        category="inference.transformers",
+        value_type="string",
+        default="auto",
+        description="Compute device",
+        env_fallback="JARVIS_DEVICE",
+        requires_reload=True,
+        options=["auto", "cuda", "mps", "cpu"],
+    ),
+    SettingDefinition(
+        key="inference.transformers.torch_dtype",
+        category="inference.transformers",
+        value_type="string",
+        default="auto",
+        description="Torch dtype",
+        env_fallback="JARVIS_TORCH_DTYPE",
+        requires_reload=True,
+        options=["auto", "float16", "float32", "bfloat16"],
+    ),
+    SettingDefinition(
+        key="inference.transformers.use_quantization",
+        category="inference.transformers",
+        value_type="bool",
+        default=False,
+        description="Enable bitsandbytes quantization",
+        env_fallback="JARVIS_USE_QUANTIZATION",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="inference.transformers.quantization_type",
+        category="inference.transformers",
+        value_type="string",
+        default="4bit",
+        description="Quantization type",
+        env_fallback="JARVIS_QUANTIZATION_TYPE",
+        requires_reload=True,
+        options=["4bit", "8bit"],
+    ),
+    SettingDefinition(
+        key="inference.transformers.device_map",
+        category="inference.transformers",
+        value_type="string",
+        default="auto",
+        description="Device map for transformers",
+        env_fallback="JARVIS_TRANSFORMERS_DEVICE_MAP",
+        requires_reload=True,
+        options=["auto", "none"],
+    ),
+    # ==================== inference.general ====================
+    SettingDefinition(
+        key="inference.general.engine",
+        category="inference.general",
+        value_type="string",
+        default="llama_cpp",
+        description="Default inference engine",
+        env_fallback="JARVIS_INFERENCE_ENGINE",
+        requires_reload=True,
+        options=["llama_cpp", "vllm", "transformers"],
+    ),
+    SettingDefinition(
+        key="inference.general.max_tokens",
+        category="inference.general",
+        value_type="int",
+        default=512,
+        description="Default max generation tokens",
+        env_fallback="JARVIS_MAX_TOKENS",
+    ),
+    SettingDefinition(
+        key="inference.general.top_p",
+        category="inference.general",
+        value_type="float",
+        default=0.95,
+        description="Top-P sampling value",
+        env_fallback="JARVIS_TOP_P",
+    ),
+    SettingDefinition(
+        key="inference.general.top_k",
+        category="inference.general",
+        value_type="int",
+        default=40,
+        description="Top-K sampling value",
+        env_fallback="JARVIS_TOP_K",
+    ),
+    SettingDefinition(
+        key="inference.general.repeat_penalty",
+        category="inference.general",
+        value_type="float",
+        default=1.1,
+        description="Repetition penalty",
+        env_fallback="JARVIS_REPEAT_PENALTY",
+    ),
+    # ==================== training ====================
+    SettingDefinition(
+        key="training.adapter_dir",
+        category="training",
+        value_type="string",
+        default="/tmp/jarvis-adapters",
+        description="Local adapter storage directory",
+        env_fallback="LLM_PROXY_ADAPTER_DIR",
+    ),
+    SettingDefinition(
+        key="training.batch_size",
+        category="training",
+        value_type="int",
+        default=1,
+        description="Training batch size",
+        env_fallback="JARVIS_ADAPTER_BATCH_SIZE",
+    ),
+    SettingDefinition(
+        key="training.grad_accum",
+        category="training",
+        value_type="int",
+        default=4,
+        description="Gradient accumulation steps",
+        env_fallback="JARVIS_ADAPTER_GRAD_ACCUM",
+    ),
+    SettingDefinition(
+        key="training.epochs",
+        category="training",
+        value_type="int",
+        default=1,
+        description="Training epochs",
+        env_fallback="JARVIS_ADAPTER_EPOCHS",
+    ),
+    SettingDefinition(
+        key="training.learning_rate",
+        category="training",
+        value_type="float",
+        default=2e-4,
+        description="Training learning rate",
+        env_fallback="JARVIS_ADAPTER_LEARNING_RATE",
+    ),
+    SettingDefinition(
+        key="training.lora_r",
+        category="training",
+        value_type="int",
+        default=16,
+        description="LoRA rank",
+        env_fallback="JARVIS_ADAPTER_LORA_R",
+    ),
+    SettingDefinition(
+        key="training.lora_alpha",
+        category="training",
+        value_type="int",
+        default=32,
+        description="LoRA alpha scaling",
+        env_fallback="JARVIS_ADAPTER_LORA_ALPHA",
+    ),
+    SettingDefinition(
+        key="training.lora_dropout",
+        category="training",
+        value_type="float",
+        default=0.05,
+        description="LoRA dropout rate",
+        env_fallback="JARVIS_ADAPTER_LORA_DROPOUT",
+    ),
+    SettingDefinition(
+        key="training.max_seq_len",
+        category="training",
+        value_type="int",
+        default=2048,
+        description="Maximum sequence length for training",
+        env_fallback="JARVIS_ADAPTER_MAX_SEQ_LEN",
+    ),
+    # ==================== storage ====================
+    SettingDefinition(
+        key="storage.s3_endpoint_url",
+        category="storage",
+        value_type="string",
+        default="",
+        description="S3 endpoint URL (for MinIO)",
+        env_fallback="S3_ENDPOINT_URL",
+    ),
+    SettingDefinition(
+        key="storage.s3_region",
+        category="storage",
+        value_type="string",
+        default="us-east-1",
+        description="S3 region",
+        env_fallback="S3_REGION",
+    ),
+    SettingDefinition(
+        key="storage.adapter_bucket",
+        category="storage",
+        value_type="string",
+        default="jarvis-llm-proxy",
+        description="S3 bucket for adapters",
+        env_fallback="LLM_PROXY_ADAPTER_BUCKET",
+    ),
+    SettingDefinition(
+        key="storage.adapter_prefix",
+        category="storage",
+        value_type="string",
+        default="adapters",
+        description="S3 prefix for adapters",
+        env_fallback="LLM_PROXY_ADAPTER_PREFIX",
+    ),
+    SettingDefinition(
+        key="storage.s3_force_path_style",
+        category="storage",
+        value_type="bool",
+        default=False,
+        description="Force S3 path-style addressing (MinIO)",
+        env_fallback="S3_FORCE_PATH_STYLE",
+    ),
+    # ==================== logging ====================
+    SettingDefinition(
+        key="logging.console_level",
+        category="logging",
+        value_type="string",
+        default="WARNING",
+        description="Console log level",
+        env_fallback="JARVIS_LOG_CONSOLE_LEVEL",
+        options=["DEBUG", "INFO", "WARNING", "ERROR"],
+    ),
+    SettingDefinition(
+        key="logging.remote_level",
+        category="logging",
+        value_type="string",
+        default="DEBUG",
+        description="Remote (jarvis-logs) log level",
+        env_fallback="JARVIS_LOG_REMOTE_LEVEL",
+        options=["DEBUG", "INFO", "WARNING", "ERROR"],
+    ),
+    # ==================== model REST URLs ====================
+    SettingDefinition(
+        key="model.main.rest_url",
+        category="model.main",
+        value_type="string",
+        default="",
+        description="REST URL for main model backend",
+        env_fallback="JARVIS_REST_MODEL_URL",
+        requires_reload=True,
+    ),
+    SettingDefinition(
+        key="model.main.rest_model_name",
+        category="model.main",
+        value_type="string",
+        default="",
+        description="REST model name override for main model",
+        env_fallback="JARVIS_REST_MODEL_NAME",
+        requires_reload=True,
+    ),
+    # ==================== cache ====================
+    SettingDefinition(
+        key="cache.type",
+        category="cache",
+        value_type="string",
+        default="local",
+        description="Cache type",
+        env_fallback="JARVIS_CACHE_TYPE",
+        options=["local", "redis"],
+    ),
+    SettingDefinition(
+        key="cache.session_ttl_seconds",
+        category="cache",
+        value_type="int",
+        default=600,
+        description="Session TTL in seconds",
+        env_fallback="JARVIS_SESSION_TTL",
+    ),
+    SettingDefinition(
+        key="cache.cleanup_interval_seconds",
+        category="cache",
+        value_type="int",
+        default=30,
+        description="Cache cleanup interval in seconds",
+        env_fallback="JARVIS_CACHE_CLEANUP_INTERVAL",
+    ),
+    # ==================== adapter cache ====================
+    SettingDefinition(
+        key="adapter_cache.max_size",
+        category="adapter_cache",
+        value_type="int",
+        default=10,
+        description="Max adapters tracked in memory",
+        env_fallback="LLM_PROXY_ADAPTER_CACHE_MAX_SIZE",
+    ),
+    SettingDefinition(
+        key="adapter_cache.evict_disk",
+        category="adapter_cache",
+        value_type="bool",
+        default=False,
+        description="Evict adapter disk cache on LRU eviction",
+        env_fallback="LLM_PROXY_ADAPTER_CACHE_EVICT_DISK",
+    ),
+    # ==================== model service ====================
+    SettingDefinition(
+        key="model_service.url",
+        category="model_service",
+        value_type="string",
+        default="http://127.0.0.1:7705",
+        description="Internal model service URL",
+        env_fallback="MODEL_SERVICE_URL",
+    ),
+    SettingDefinition(
+        key="model_service.timeout_seconds",
+        category="model_service",
+        value_type="float",
+        default=60.0,
+        description="Timeout in seconds for model service requests",
+        env_fallback="MODEL_SERVICE_TIMEOUT",
+    ),
+    # ==================== queue ====================
+    SettingDefinition(
+        key="queue.name",
+        category="queue",
+        value_type="string",
+        default="llm_proxy_jobs",
+        description="Queue name for async jobs",
+        env_fallback="LLM_PROXY_QUEUE_NAME",
+    ),
+    SettingDefinition(
+        key="queue.per_attempt_timeout_seconds",
+        category="queue",
+        value_type="float",
+        default=0.0,
+        description="Per-attempt timeout seconds (0 for none)",
+        env_fallback="LLM_PROXY_PER_ATTEMPT_TIMEOUT",
+    ),
+    SettingDefinition(
+        key="queue.callback_timeout_seconds",
+        category="queue",
+        value_type="float",
+        default=10.0,
+        description="Callback timeout seconds",
+        env_fallback="LLM_PROXY_CALLBACK_TIMEOUT",
+    ),
+    # ==================== inference.gguf extras ====================
+    SettingDefinition(
+        key="inference.gguf.enable_context_cache",
+        category="inference.gguf",
+        value_type="bool",
+        default=True,
+        description="Enable GGUF context cache",
+        env_fallback="JARVIS_ENABLE_CONTEXT_CACHE",
+    ),
+    SettingDefinition(
+        key="inference.gguf.max_cache_size",
+        category="inference.gguf",
+        value_type="int",
+        default=100,
+        description="Max GGUF context cache size",
+        env_fallback="JARVIS_MAX_CACHE_SIZE",
+    ),
+    SettingDefinition(
+        key="inference.gguf.rope_scaling_type",
+        category="inference.gguf",
+        value_type="int",
+        default=0,
+        description="RoPE scaling type for GGUF",
+        env_fallback="JARVIS_ROPE_SCALING_TYPE",
+    ),
+    SettingDefinition(
+        key="inference.gguf.seed",
+        category="inference.gguf",
+        value_type="int",
+        default=42,
+        description="Random seed for GGUF backend",
+        env_fallback="JARVIS_SEED",
+    ),
+    SettingDefinition(
+        key="inference.gguf.verbose",
+        category="inference.gguf",
+        value_type="bool",
+        default=False,
+        description="Enable verbose GGUF logging",
+        env_fallback="JARVIS_VERBOSE",
+    ),
+    SettingDefinition(
+        key="inference.gguf.mirostat_mode",
+        category="inference.gguf",
+        value_type="int",
+        default=0,
+        description="Mirostat mode for GGUF",
+        env_fallback="JARVIS_MIROSTAT_MODE",
+    ),
+    SettingDefinition(
+        key="inference.gguf.mirostat_tau",
+        category="inference.gguf",
+        value_type="float",
+        default=5.0,
+        description="Mirostat tau for GGUF",
+        env_fallback="JARVIS_MIROSTAT_TAU",
+    ),
+    SettingDefinition(
+        key="inference.gguf.mirostat_eta",
+        category="inference.gguf",
+        value_type="float",
+        default=0.1,
+        description="Mirostat eta for GGUF",
+        env_fallback="JARVIS_MIROSTAT_ETA",
+    ),
+    # ==================== inference.transformers extras ====================
+    SettingDefinition(
+        key="inference.transformers.do_sample",
+        category="inference.transformers",
+        value_type="bool",
+        default=True,
+        description="Enable sampling for transformers backend",
+        env_fallback="JARVIS_DO_SAMPLE",
+    ),
+    SettingDefinition(
+        key="inference.transformers.use_cache",
+        category="inference.transformers",
+        value_type="bool",
+        default=True,
+        description="Use model cache for transformers backend",
+        env_fallback="JARVIS_USE_CACHE",
+    ),
+    SettingDefinition(
+        key="inference.transformers.trust_remote_code",
+        category="inference.transformers",
+        value_type="bool",
+        default=False,
+        description="Trust remote code for transformers backend",
+        env_fallback="JARVIS_TRUST_REMOTE_CODE",
+    ),
+    # ==================== REST backend ====================
+    SettingDefinition(
+        key="rest.provider",
+        category="rest",
+        value_type="string",
+        default="generic",
+        description="REST provider name",
+        env_fallback="JARVIS_REST_PROVIDER",
+    ),
+    SettingDefinition(
+        key="rest.request_format",
+        category="rest",
+        value_type="string",
+        default="openai",
+        description="REST request format",
+        env_fallback="JARVIS_REST_REQUEST_FORMAT",
+    ),
+    SettingDefinition(
+        key="rest.timeout_seconds",
+        category="rest",
+        value_type="int",
+        default=60,
+        description="REST request timeout seconds",
+        env_fallback="JARVIS_REST_TIMEOUT",
+    ),
+    SettingDefinition(
+        key="rest.auth_type",
+        category="rest",
+        value_type="string",
+        default="none",
+        description="REST auth type",
+        env_fallback="JARVIS_REST_AUTH_TYPE",
+        options=["none", "bearer", "api_key", "custom"],
+    ),
+    SettingDefinition(
+        key="rest.auth_header_name",
+        category="rest",
+        value_type="string",
+        default="Authorization",
+        description="REST auth header name",
+        env_fallback="JARVIS_REST_AUTH_HEADER",
+    ),
+    SettingDefinition(
+        key="rest.auth_token",
+        category="rest",
+        value_type="string",
+        default="",
+        description="Auth token / API key for the REST backend (e.g. OpenAI API key)",
+        env_fallback="JARVIS_REST_AUTH_TOKEN",
+        requires_reload=True,
+        is_secret=True,
+    ),
+    # ==================== training extras ====================
+    SettingDefinition(
+        key="training.backend",
+        category="training",
+        value_type="string",
+        default="auto",
+        description="Training backend (auto detects platform)",
+        env_fallback="JARVIS_ADAPTER_TRAIN_BACKEND",
+        options=["auto", "mlx", "transformers"],
+    ),
+    SettingDefinition(
+        key="training.train_cmd",
+        category="training",
+        value_type="string",
+        default="python3 scripts/train_adapter.py",
+        description="Adapter training command (overrides backend auto-detection if changed from default)",
+        env_fallback="JARVIS_ADAPTER_TRAIN_CMD",
+    ),
+    SettingDefinition(
+        key="training.public_url_prefix",
+        category="training",
+        value_type="string",
+        default="",
+        description="Public URL prefix for training artifacts",
+        env_fallback="JARVIS_ADAPTER_PUBLIC_URL_PREFIX",
+    ),
+    SettingDefinition(
+        key="training.train_timeout_seconds",
+        category="training",
+        value_type="int",
+        default=0,
+        description="Training timeout seconds (0 for default)",
+        env_fallback="JARVIS_ADAPTER_TRAIN_TIMEOUT_SECONDS",
+    ),
+    SettingDefinition(
+        key="training.adapter_hf_base_model_id",
+        category="training",
+        value_type="string",
+        default="",
+        description="HF base model ID for GGUF training",
+        env_fallback="JARVIS_ADAPTER_HF_BASE_MODEL_ID",
+    ),
+    SettingDefinition(
+        key="training.adapter_gguf_convert_cmd",
+        category="training",
+        value_type="string",
+        default="",
+        description="GGUF conversion command override",
+        env_fallback="JARVIS_ADAPTER_GGUF_CONVERT_CMD",
+    ),
+    SettingDefinition(
+        key="training.adapter_train_dtype",
+        category="training",
+        value_type="string",
+        default="auto",
+        description="Training dtype",
+        env_fallback="JARVIS_ADAPTER_TRAIN_DTYPE",
+    ),
+    SettingDefinition(
+        key="training.adapter_train_load_in_4bit",
+        category="training",
+        value_type="bool",
+        default=False,
+        description="Use 4bit training load",
+        env_fallback="JARVIS_ADAPTER_TRAIN_LOAD_IN_4BIT",
+    ),
+    SettingDefinition(
+        key="training.adapter_train_load_in_8bit",
+        category="training",
+        value_type="bool",
+        default=False,
+        description="Use 8bit training load",
+        env_fallback="JARVIS_ADAPTER_TRAIN_LOAD_IN_8BIT",
+    ),
+    SettingDefinition(
+        key="training.adapter_train_device_map",
+        category="training",
+        value_type="string",
+        default="",
+        description="Training device map override",
+        env_fallback="JARVIS_ADAPTER_TRAIN_DEVICE_MAP",
+    ),
+    SettingDefinition(
+        key="training.date_adapter_train_load_in_4bit",
+        category="training",
+        value_type="bool",
+        default=True,
+        description="Date adapter training 4bit load",
+        env_fallback="JARVIS_DATE_ADAPTER_TRAIN_LOAD_IN_4BIT",
+    ),
+    SettingDefinition(
+        key="training.output_dir",
+        category="training",
+        value_type="string",
+        default="",
+        description="Training output directory",
+        env_fallback="JARVIS_TRAIN_OUTPUT_DIR",
+    ),
+    SettingDefinition(
+        key="training.dataset_path",
+        category="training",
+        value_type="string",
+        default="",
+        description="Training dataset path",
+        env_fallback="JARVIS_TRAIN_DATASET_PATH",
+    ),
+    SettingDefinition(
+        key="training.params_path",
+        category="training",
+        value_type="string",
+        default="",
+        description="Training params path",
+        env_fallback="JARVIS_TRAIN_PARAMS_PATH",
+    ),
+    SettingDefinition(
+        key="training.base_model_id",
+        category="training",
+        value_type="string",
+        default="",
+        description="Training base model ID override",
+        env_fallback="JARVIS_TRAIN_BASE_MODEL_ID",
+    ),
+    # ==================== adapter deployment ====================
+    SettingDefinition(
+        key="adapter.pause_serving_during_training",
+        category="adapter",
+        value_type="bool",
+        default=True,
+        description=(
+            "Unload the live model before adapter training and reload after. "
+            "Required on single-GPU hosts where serving + training can't coexist "
+            "(e.g. 12GB Ubuntu boxes). Voice commands will 5xx briefly during the "
+            "pause window. Safe to disable on hosts with enough headroom or on "
+            "MLX (Apple) setups where training is lightweight and model_service.url "
+            "is typically unset."
+        ),
+        env_fallback="ADAPTER_PAUSE_SERVING_DURING_TRAINING",
+    ),
+    # ==================== date keys ====================
+    SettingDefinition(
+        key="date_keys.disable_llm",
+        category="date_keys",
+        value_type="bool",
+        default=False,
+        description="Disable LLM date key extraction",
+        env_fallback="JARVIS_DISABLE_DATE_KEY_LLM",
+    ),
+    SettingDefinition(
+        key="date_keys.device_map",
+        category="date_keys",
+        value_type="string",
+        default="cpu",
+        description="Device map for date key LLM",
+        env_fallback="JARVIS_DATE_KEY_DEVICE_MAP",
+    ),
+    # ==================== debug ====================
+    SettingDefinition(
+        key="debug.enabled",
+        category="debug",
+        value_type="bool",
+        default=False,
+        description="Enable debug mode",
+        env_fallback="DEBUG",
+    ),
+    SettingDefinition(
+        key="debug.port",
+        category="debug",
+        value_type="int",
+        default=5678,
+        description="Debug port for debugpy",
+        env_fallback="DEBUG_PORT",
+    ),
+    SettingDefinition(
+        key="debug.dump_gbnf_path",
+        category="debug",
+        value_type="string",
+        default="",
+        description="Path to dump GBNF grammar",
+        env_fallback="JARVIS_DUMP_GBNF_PATH",
+    ),
+]
+
+
+# Global singleton
+_settings_service: SettingsService | None = None
+
+
+def get_settings_service() -> SettingsService:
+    """Get the global SettingsService instance."""
+    global _settings_service
+    if _settings_service is None:
+        from db.models import Setting
+        from db.session import SessionLocal
+
+        _settings_service = SettingsService(
+            definitions=SETTINGS_DEFINITIONS,
+            get_db_session=SessionLocal,
+            setting_model=Setting,
+        )
+    return _settings_service

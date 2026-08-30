@@ -1,0 +1,63 @@
+version: '3.9'
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      - JARVIS_DOMAIN=${JARVIS_DOMAIN:-localhost}
+      - CADDY_PORT=${CADDY_PORT:-443}
+    depends_on:
+      jarvis-voice-api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    # pg16 aligns with jarvis-installer (source of truth). Major bump is not
+    # in-place data-compatible; see docs/postgres-pg15-to-pg16-migration.md.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: jarvis_command_center
+      POSTGRES_USER: jarvis_user
+      POSTGRES_PASSWORD: jarvis_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jarvis_user -d jarvis_command_center"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  jarvis-voice-api:
+    build: .
+    ports:
+      - "7703:7703"
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DATABASE_URL=${DATABASE_URL:-postgresql://jarvis_user:jarvis_password@postgres:5432/jarvis_command_center}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7703/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 7703"
+
+volumes:
+  postgres_data:
+  caddy-data:
+  caddy-config:

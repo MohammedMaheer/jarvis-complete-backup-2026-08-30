@@ -1,0 +1,108 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+      - "9443:9443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      - JARVIS_DOMAIN=${JARVIS_DOMAIN:-localhost}
+      - CADDY_PORT=${CADDY_PORT:-443}
+    depends_on:
+      - jarvis-voice-api
+
+  jarvis-voice-api:
+    build: .
+    ports:
+      - "7703:7703"
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+      - ./temp:/app/temp
+      - ./.env:/app/.env
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+      - ../jarvis-log-client:/app/jarvis-log-client
+      - ../jarvis-config-client:/app/jarvis-config-client
+      - ../jarvis-settings-client:/app/jarvis-settings-client
+      - ../jarvis-auth-client:/app/jarvis-auth-client
+      - ../jarvis-mcp-client:/app/jarvis-mcp-client
+      - ../jarvis-web-scraper:/app/jarvis-web-scraper
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Use DB_URL from .env (central postgres)
+      - DATABASE_URL=${DB_URL}
+      - JARVIS_AUTH_SECRET_KEY=${JARVIS_AUTH_SECRET_KEY}
+      - JARVIS_EXTERNAL_URL=${JARVIS_EXTERNAL_URL:-}
+      - JARVIS_RELAY_URL=${JARVIS_RELAY_URL:-}
+      - JARVIS_COMMAND_CENTER_URL=${JARVIS_COMMAND_CENTER_URL:-http://host.docker.internal:7703}
+    extra_hosts:
+      - "${DOCKER_HOST_ALIAS:-host.docker.internal}:host-gateway"
+    command: >
+      sh -c "for lib in jarvis-log-client jarvis-config-client jarvis-settings-client jarvis-auth-client jarvis-mcp-client jarvis-web-scraper; do
+               [ -f /app/$$lib/pyproject.toml ] && pip install -q -e /app/$$lib || echo \"SKIP $$lib (not found)\";
+             done &&
+             alembic upgrade head &&
+             python -Xfrozen_modules=off -m uvicorn app.main:app --host 0.0.0.0 --port 7703 --reload"
+
+  postgres:
+    profiles: ["standalone"]
+    # pg16 aligns with jarvis-installer (source of truth). Major bump is not
+    # in-place data-compatible; see docs/postgres-pg15-to-pg16-migration.md.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: jarvis_command_center
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - cc-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Disposable Postgres for the test suite. Separate from `postgres` above
+  # (that one is the standalone DEV database on 5432 with its own volume).
+  #
+  # Port 5544, not 5433: CI publishes its Postgres on 5433 and the committed
+  # TEST_DATABASE_URL default matches that, but on a dev box running the full
+  # jarvis stack 5433 is pantry's database — so the suite connected happily to
+  # the wrong server and failed with "password authentication failed for user
+  # jarvis_user", which reads like a credentials problem rather than a port
+  # collision. Anything but 5433 avoids the confusion.
+  #
+  # pg16, matching the repo-wide pin that test_compose_pgvector_pin.py guards
+  # (roadmap#46: majors are not data-compatible, so a mixed setup fails with
+  # "database files are incompatible with server"). Note CI still runs its
+  # Postgres service on pg15 — that divergence predates this file and is worth
+  # closing separately. tmpfs storage: this database is meant to be thrown
+  # away and never wants a volume that could outlive a schema change.
+  postgres-test:
+    profiles: ["test"]
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: jarvis_user
+      POSTGRES_PASSWORD: jarvis_password
+      POSTGRES_DB: jarvis_command_center
+    ports:
+      - "5544:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jarvis_user -d jarvis_command_center"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  cc-pg-data:
+  caddy-data:
+  caddy-config:

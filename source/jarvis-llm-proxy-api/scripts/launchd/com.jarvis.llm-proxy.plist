@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jarvis.llm-proxy</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__ROOT__/run-prod.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__ROOT__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Native macOS services reach Docker peers via host-published localhost
+             ports. config-service advertises host.docker.internal by default (for
+             Docker consumers); 'external' makes it return each service's
+             external_host (localhost) instead, so app-auth to jarvis-auth
+             resolves off-container. Requires jarvis-config-client >= 0.2.1. -->
+        <key>JARVIS_CONFIG_URL_STYLE</key>
+        <string>external</string>
+        <key>ENV_FILE</key>
+        <string>__ENV_FILE__</string>
+        <key>SERVER_HOST</key>
+        <string>0.0.0.0</string>
+        <key>SERVER_PORT</key>
+        <string>__PORT__</string>
+        <key>RUN_MODEL_SERVICE</key>
+        <string>true</string>
+        <key>MODEL_SERVICE_PORT</key>
+        <string>7705</string>
+        <key>RUN_QUEUE_WORKER</key>
+        <string>true</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/__USER__/Library/Logs/jarvis-llm-proxy/out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/__USER__/Library/Logs/jarvis-llm-proxy/err.log</string>
+</dict>
+</plist>

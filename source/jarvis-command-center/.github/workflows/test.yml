@@ -1,0 +1,68 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      # Full app + DB tests need a real Postgres with pgvector. The embeddings
+      # migration self-creates the `vector` extension, so no extra setup step
+      # is required beyond using the pgvector image.
+      postgres:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_USER: jarvis_user
+          POSTGRES_PASSWORD: jarvis_password
+          POSTGRES_DB: jarvis_command_center
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U jarvis_user -d jarvis_command_center"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.11'
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        # Installs the full dependency set declared in pyproject (incl. the
+        # jarvis-*-client git deps and pytest-env) — the whole suite imports
+        # `app.main`, so a partial install is not enough.
+        pip install -e ".[dev]"
+
+    - name: Run tests
+      env:
+        # conftest runs alembic migrations against this DB and uses
+        # transaction-rollback isolation per test. The `llm` tests are excluded
+        # by default via pytest.ini (-k "not llm"; they need external services).
+        DATABASE_URL: postgresql://jarvis_user:jarvis_password@localhost:5433/jarvis_command_center
+        # Auth is mocked in tests (dependency overrides), but full-app routes
+        # resolve the auth URL and verify_user_jwt needs a secret to *cleanly*
+        # 401 an invalid token (it 500s if the secret is unset). Placeholders —
+        # never actually called against a real auth service.
+        JARVIS_AUTH_BASE_URL: http://localhost:7701
+        JARVIS_AUTH_SECRET_KEY: test-secret-key-not-used-against-real-auth
+      run: |
+        pytest tests/ --tb=short

@@ -1,0 +1,136 @@
+"""LLM Proxy API - Main Entry Point.
+
+OpenAI-compatible API that proxies requests to the model service.
+This module sets up the FastAPI application and includes all route routers.
+"""
+
+import multiprocessing
+
+# Fix for vLLM CUDA multiprocessing issue - set spawn method early
+try:
+    multiprocessing.set_start_method("spawn", force=True)
+except RuntimeError:
+    # Already set, ignore
+    pass
+
+
+from dotenv import load_dotenv
+
+# Load .env before any config/route imports that read env vars at module level
+load_dotenv()
+
+from fastapi import FastAPI
+
+# Config setup
+from config.logging_config import (
+    setup_console_logging,
+    setup_remote_logging,
+    print_startup_info,
+)
+from config.debug_config import setup_debugpy
+from config.service_config import (
+    init as init_service_config,
+    shutdown as shutdown_service_config,
+)
+
+# Route modules
+from api.chat_routes import router as chat_router
+from api.queue_routes import router as queue_router
+from api.model_routes import router as model_router
+from api.health_routes import router as health_router
+from api.training_routes import router as training_router
+from api.adapter_routes import router as adapter_router
+from api.pipeline_routes import router as pipeline_router
+from api.settings_routes import router as settings_router
+from api.embedding_routes import router as embedding_router
+
+# Initialize logging
+logger = setup_console_logging()
+
+# Set up debug mode
+setup_debugpy()
+
+# Print startup info
+print_startup_info()
+
+# Create FastAPI application
+app = FastAPI()
+
+# Include all route routers
+app.include_router(chat_router)
+app.include_router(queue_router)
+app.include_router(model_router)
+app.include_router(health_router)
+app.include_router(training_router)
+app.include_router(adapter_router)
+app.include_router(pipeline_router)
+app.include_router(settings_router)
+app.include_router(embedding_router)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize service config, remote logging, and pre-warm DB on startup."""
+    # Service discovery first (auth URL, logs URL, etc.)
+    try:
+        from db.session import engine as db_engine
+        init_service_config(db_engine=db_engine)
+    except Exception as e:
+        logger.warning(f"Service config init failed (non-fatal): {e}")
+        # Still try without DB caching
+        try:
+            init_service_config()
+        except Exception as e:
+            pass
+
+    setup_remote_logging()
+
+    # Pre-warm database connection to avoid first-request failures
+    try:
+        from sqlalchemy import text
+
+        from db.session import SessionLocal
+        from db.models import TrainingJob  # noqa: F401 - import to trigger table mapping
+
+        db = SessionLocal()
+        # Simple query to establish connection and warm the pool
+        db.execute(text("SELECT 1"))
+        db.close()
+        logger.info("Database connection pre-warmed successfully")
+    except Exception as e:
+        logger.warning(f"Database pre-warm failed (non-fatal): {e}")
+
+    # Pre-warm the embedding model so the first memory-recall request never pays
+    # the ~4s cold load on the voice hot path. It's a lazy singleton otherwise, and
+    # because voice turns are sporadic the encoder kept getting hit cold — adding
+    # ~6.5s (cold load + first-embed warmup) before the chat model was even called.
+    # It's a single shared ~80MB CPU encoder (all-MiniLM-L6-v2), tenant-agnostic
+    # (isolation lives in the pgvector rows, not the model), so one warm instance
+    # serves every household/node. Warmed in a daemon thread so startup + /health
+    # stay instant; by the time the first real recall lands it's already resident.
+    try:
+        import threading as _threading
+
+        def _warm_embeddings() -> None:
+            try:
+                from managers.embedding_manager import EmbeddingManager
+
+                EmbeddingManager.get_instance()._ensure_loaded()
+                logger.info("Embedding model pre-warmed at startup")
+            except Exception as e:  # noqa: BLE001 — non-fatal, falls back to lazy load
+                logger.warning(f"Embedding pre-warm failed (non-fatal): {e}")
+
+        _threading.Thread(
+            target=_warm_embeddings, name="embed-warmup", daemon=True
+        ).start()
+    except Exception as e:
+        logger.warning(f"Embedding pre-warm thread failed to start (non-fatal): {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up service config and logging handlers on shutdown."""
+    shutdown_service_config()
+    for handler in logger.handlers:
+        if hasattr(handler, "close"):
+            handler.close()

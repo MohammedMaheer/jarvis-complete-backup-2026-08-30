@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-command-center"
+version = "0.1.0"
+description = "Central voice command API for the Jarvis ecosystem"
+requires-python = ">=3.11"
+dependencies = [
+    "jarvis-config-client @ git+https://github.com/alexberardi/jarvis-config-client.git@c1c8903",
+    "jarvis-log-client @ git+https://github.com/alexberardi/jarvis-log-client.git@c2f8e82",
+    "fastapi>=0.104,<1.0",
+    "uvicorn>=0.24,<1.0",
+    "python-multipart>=0.0.6,<1.0",
+    "sqlalchemy>=2,<3",
+    "alembic>=1.12,<2",
+    "pydantic>=2,<3",
+    "watchdog>=3,<7",
+    "python-dotenv>=1,<2",
+    "httpx>=0.25,<1.0",
+    "websockets>=12,<18",
+    "debugpy>=1.8,<2",
+    "rapidfuzz>=3,<4",
+    "psycopg2-binary>=2.9,<3",
+    "pgvector>=0.3.0",
+    "pytz>=2023",
+    "fasttext>=0.9,<1.0",
+    "numpy<3",
+    "paho-mqtt>=2,<3",
+    "cryptography>=42,<51",
+    "jarvis-settings-client @ git+https://github.com/alexberardi/jarvis-settings-client.git@402674d",
+    "jarvis-auth-client @ git+https://github.com/alexberardi/jarvis-auth-client.git@4549b23",
+    "ddgs>=7.0.0",
+    "redis>=5,<9",
+    # Pinned to the commit adding FetchConfig.enable_jina_fallback (r.jina.ai opt-in).
+    # The Jina gate in deep_research_service.py requires this lib version at runtime.
+    "jarvis-web-scraper @ git+https://github.com/alexberardi/jarvis-web-scraper.git@16d912fe9613bb0b3af4e328f4f1eda8ff77fdec",
+    "pyyaml>=6,<7",
+    "croniter>=2,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-env>=1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]

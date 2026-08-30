@@ -1,0 +1,989 @@
+import logging
+import os
+import random
+import threading
+import time
+from typing import Any, Dict, Generator, List, Optional
+
+from .power_metrics import PowerMetrics
+import backends.chat_formats  # noqa: F401 — registers custom chat format handlers
+from managers.chat_types import NormalizedMessage, TextPart, GenerationParams, ChatResult
+from backends.base import LLMBackendBase
+from services.settings_helpers import (
+    get_bool_setting,
+    get_float_setting,
+    get_int_setting,
+    get_setting,
+)
+
+# gpu_select.py lives at the repo root (on sys.path — the service runs from /app).
+# Tolerant import: a build that somehow omits the file must not crash the backend;
+# the fallback keeps AUTO conservative (single-GPU).
+try:
+    from gpu_select import auto_gguf_split_mode
+except Exception:  # pragma: no cover — only hit if gpu_select.py is missing
+
+    def auto_gguf_split_mode() -> int:
+        return 0
+
+logger = logging.getLogger("uvicorn")
+
+
+class GGUFClient(LLMBackendBase):
+    def __init__(self, model_path: str, chat_format: str, stop_tokens: List[str] = None, context_window: int = None):
+        if not model_path:
+            raise ValueError("Model path is required")
+
+        # Store model name for unload functionality
+        self.model_name = model_path
+        self.model_path = model_path
+        self.chat_format = chat_format
+        self.model = None
+        self.last_usage = None
+        self._lock = threading.Lock()  # Add thread safety
+
+        # Adapter state tracking (constructor-based loading)
+        self._current_adapter_hash: Optional[str] = None
+        self._current_adapter_path: Optional[str] = None
+        self._current_adapter_scale: float = 1.0
+
+        # Context cache for prefix matching optimization
+        self.context_cache = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+        # Initialize power monitoring (optional)
+        self.power_metrics = PowerMetrics()
+        self.power_metrics.start_monitoring()
+
+        # Get context window from parameter or environment variable, default to 4096 for better performance
+        if context_window is None:
+            context_window = get_int_setting(
+                "model.main.context_window", "JARVIS_MODEL_CONTEXT_WINDOW", 4096
+            )
+
+        # Get optimal thread count based on CPU cores
+        n_threads = get_int_setting(
+            "inference.gguf.n_threads", "JARVIS_N_THREADS", min(10, os.cpu_count() or 4)
+        )
+
+        # Get GPU layers - be more conservative to avoid memory issues
+        n_gpu_layers = get_int_setting(
+            "inference.gguf.n_gpu_layers", "JARVIS_N_GPU_LAYERS", -1
+        )
+
+        # Multi-GPU configuration
+        # split_mode: -1=auto (default), 0=NONE (single GPU / main_gpu only),
+        # 1=LAYER (split layers across GPUs), 2=ROW (split rows across GPUs).
+        # Auto resolves to LAYER only when >=2 NVIDIA GPUs are visible AND the
+        # topology is split-worthy — identical cards (the dual-3090 prod box,
+        # where single-GPU piles both models onto GPU0 and OOMs at boot) or
+        # mixed cards that all clear a VRAM floor; a big compute card next to a
+        # small display card stays single-GPU (see gpu_select.auto_gguf_split_mode).
+        # Blanket auto-split is still a footgun on AMD boxes where a kernel-less
+        # iGPU (gfx1036) enumerates next to the dGPU, but gpu_select already pins
+        # those to the one dGPU via HIP/GGML_VK_VISIBLE_DEVICES, so a single
+        # device is visible and split mode is moot. An explicit DB/env value
+        # (0/1/2) always wins over auto.
+        split_mode = get_int_setting(
+            "inference.gguf.split_mode", "JARVIS_GGUF_SPLIT_MODE", -1
+        )
+        if split_mode == -1:
+            split_mode = auto_gguf_split_mode()
+            if split_mode == 1:
+                logger.info("split_mode auto → LAYER (multi-GPU CUDA topology)")
+            else:
+                logger.info("split_mode auto → single-GPU")
+        # main_gpu: index of the GPU to use for scratch buffers and small tensors
+        main_gpu = get_int_setting(
+            "inference.gguf.main_gpu", "JARVIS_GGUF_MAIN_GPU", 0
+        )
+        # tensor_split: comma-separated proportions for VRAM allocation per GPU (e.g. "0.5,0.5" for even split)
+        tensor_split_str = get_setting(
+            "inference.gguf.tensor_split", "JARVIS_GGUF_TENSOR_SPLIT", ""
+        ).strip()
+        tensor_split: list[float] | None = None
+        if tensor_split_str:
+            try:
+                tensor_split = [float(x.strip()) for x in tensor_split_str.split(",") if x.strip()]
+                logger.info(f"Multi-GPU tensor split: {tensor_split}")
+            except ValueError:
+                logger.warning(f"Invalid JARVIS_GGUF_TENSOR_SPLIT value: {tensor_split_str!r}, ignoring")
+                tensor_split = None
+
+
+        # Memory management settings
+        self.enable_cache = get_bool_setting(
+            "inference.gguf.enable_context_cache", "JARVIS_ENABLE_CONTEXT_CACHE", True
+        )
+        self.max_cache_size = get_int_setting(
+            "inference.gguf.max_cache_size", "JARVIS_MAX_CACHE_SIZE", 100
+        )
+
+        # LLaMA.cpp optimization parameters
+        n_batch = get_int_setting("inference.gguf.n_batch", "JARVIS_N_BATCH", 512)
+        n_ubatch = get_int_setting("inference.gguf.n_ubatch", "JARVIS_N_UBATCH", 512)
+        self.flash_attn = get_bool_setting(
+            "inference.gguf.flash_attn", "JARVIS_FLASH_ATTN", True
+        )
+        rope_scaling_type = get_int_setting(
+            "inference.gguf.rope_scaling_type", "JARVIS_ROPE_SCALING_TYPE", 0
+        )
+        mul_mat_q = get_bool_setting(
+            "inference.gguf.mul_mat_q", "JARVIS_MUL_MAT_Q", True
+        )
+        f16_kv = get_bool_setting("inference.gguf.f16_kv", "JARVIS_F16_KV", True)
+        seed = get_int_setting("inference.gguf.seed", "JARVIS_SEED", 42)
+        verbose = get_bool_setting("inference.gguf.verbose", "JARVIS_VERBOSE", False)
+
+        # Inference parameters — prefer settings service, fall back to env var
+        self.max_tokens = self._resolve_max_tokens()
+        self.top_p = get_float_setting("inference.general.top_p", "JARVIS_TOP_P", 0.95)
+        self.top_k = get_int_setting("inference.general.top_k", "JARVIS_TOP_K", 40)
+        self.repeat_penalty = get_float_setting(
+            "inference.general.repeat_penalty", "JARVIS_REPEAT_PENALTY", 1.1
+        )
+        self.mirostat_mode = get_int_setting(
+            "inference.gguf.mirostat_mode", "JARVIS_MIROSTAT_MODE", 0
+        )
+        self.mirostat_tau = get_float_setting(
+            "inference.gguf.mirostat_tau", "JARVIS_MIROSTAT_TAU", 5.0
+        )
+        self.mirostat_eta = get_float_setting(
+            "inference.gguf.mirostat_eta", "JARVIS_MIROSTAT_ETA", 0.1
+        )
+
+        # Check inference engine preference
+        inference_engine = get_setting(
+            "inference.general.engine", "JARVIS_INFERENCE_ENGINE", "llama_cpp"
+        ).lower()
+
+        logger.debug(f"🔍 Debug: Inference engine: {inference_engine}")
+        logger.debug(f"🔍 Debug: Model path: {model_path}")
+        logger.debug(f"🔍 Debug: Chat format: {chat_format}")
+        logger.debug(f"🔍 Debug: Context window: {context_window}")
+        logger.debug(f"🔍 Debug: Threads: {n_threads}")
+        logger.debug(f"🔍 Debug: GPU layers: {n_gpu_layers}")
+        if tensor_split:
+            logger.debug(f"🔍 Debug: Multi-GPU split_mode: {split_mode}, main_gpu: {main_gpu}, tensor_split: {tensor_split}")
+        logger.debug(f"🔍 Debug: Context cache: {'enabled' if self.enable_cache else 'disabled'}")
+        logger.debug(f"🔍 Debug: Batch size: {n_batch}")
+        logger.debug(f"🔍 Debug: Micro batch size: {n_ubatch}")
+        logger.debug(f"🔍 Debug: F16 KV cache: {'enabled' if f16_kv else 'disabled'}")
+        logger.debug(f"🔍 Debug: Matrix multiplication: {'enabled' if mul_mat_q else 'disabled'}")
+
+        if inference_engine == "vllm":
+            logger.info(f"🚀 Using vLLM inference engine")
+            self._init_vllm(model_path, chat_format, stop_tokens, context_window, n_threads, n_gpu_layers, verbose, seed, n_batch, n_ubatch, rope_scaling_type, mul_mat_q, f16_kv)
+        else:
+            logger.info(f"🦙 Using llama.cpp inference engine")
+            self._init_llama_cpp(model_path, chat_format, stop_tokens, context_window, n_threads, n_gpu_layers, verbose, seed, context_window, n_batch, n_ubatch, rope_scaling_type, mul_mat_q, f16_kv, split_mode=split_mode, main_gpu=main_gpu, tensor_split=tensor_split)
+
+    @staticmethod
+    def _resolve_max_tokens() -> int:
+        """Resolve max_tokens from settings service, then env var, then default."""
+        return get_int_setting("inference.general.max_tokens", "JARVIS_MAX_TOKENS", 512)
+
+    def _init_vllm(self, model_path: str, chat_format: str, stop_tokens: List[str], context_window: int, n_threads: int, n_gpu_layers: int, verbose: bool, seed: int, n_batch: int, n_ubatch: int, rope_scaling_type: int, mul_mat_q: bool, f16_kv: bool):
+        """Initialize vLLM backend (supports both HF models and GGUF files)."""
+        from .vllm_backend import VLLMClient
+        self.backend = VLLMClient(model_path, chat_format, stop_tokens, context_window)
+        self.inference_engine = "vllm"
+
+    def _init_llama_cpp(
+        self,
+        model_path: str,
+        chat_format: str,
+        stop_tokens: List[str],
+        context_window: int,
+        n_threads: int,
+        n_gpu_layers: int,
+        verbose: bool,
+        seed: int,
+        ctx_window: int,
+        n_batch: int,
+        n_ubatch: int,
+        rope_scaling_type: int,
+        mul_mat_q: bool,
+        f16_kv: bool,
+        lora_path: Optional[str] = None,
+        lora_scale: float = 1.0,
+        split_mode: int = 1,
+        main_gpu: int = 0,
+        tensor_split: list[float] | None = None,
+    ):
+        """Initialize llama.cpp backend, optionally with a LoRA adapter."""
+        from llama_cpp import Llama
+
+        if isinstance(stop_tokens, str):
+            stop_tokens = [t.strip() for t in stop_tokens.split(",") if t.strip()]
+        self.stop_tokens = stop_tokens or []
+
+        # Store init kwargs so we can reload with a different adapter later
+        self._llama_init_kwargs = {
+            "model_path": model_path,
+            "n_threads": n_threads,
+            "n_gpu_layers": n_gpu_layers,
+            "verbose": verbose,
+            "seed": seed,
+            "n_ctx": context_window,
+            "n_batch": n_batch,
+            "n_ubatch": n_ubatch,
+            "rope_scaling_type": rope_scaling_type,
+            "mul_mat_q": mul_mat_q,
+            "f16_kv": f16_kv,
+            "flash_attn": self.flash_attn,
+            "split_mode": split_mode,
+            "main_gpu": main_gpu,
+        }
+        if tensor_split:
+            self._llama_init_kwargs["tensor_split"] = tensor_split
+        if chat_format:
+            self._llama_init_kwargs["chat_format"] = chat_format
+
+        logger.debug(f"🔍 Debug: LLAMA_METAL env var: {os.getenv('LLAMA_METAL', 'not set')}")
+        logger.debug(f"🔍 Debug: Metal will be enabled: {os.getenv('LLAMA_METAL', 'false').lower() == 'true'}")
+        logger.debug(f"🔍 Debug: Loading model with n_gpu_layers={n_gpu_layers}")
+
+        # Build constructor kwargs, adding LoRA if provided
+        ctor_kwargs = dict(self._llama_init_kwargs)
+        if lora_path:
+            ctor_kwargs["lora_path"] = lora_path
+            ctor_kwargs["lora_scale"] = lora_scale
+            logger.info(f"🧩 Loading model with LoRA adapter: {lora_path} (scale={lora_scale})")
+
+        self.model = Llama(**ctor_kwargs)
+        self.backend = self
+        self.inference_engine = "llama_cpp"
+
+        # Debug: Check model loading results
+        logger.info(f"✅ Model loaded successfully!")
+        logger.debug(f"🔍 Debug: Model context size: {self.model.n_ctx()}")
+        logger.debug(f"🔍 Debug: Model vocab size: {self.model.n_vocab()}")
+
+        # Warm up the model with a small inference
+        self._warmup()
+
+        logger.debug(f"🔍 Debug: Model initialization complete")
+
+    def _warmup(self) -> None:
+        """Warm up the model with a small inference."""
+        try:
+            logger.debug(f"🔍 Debug: Warming up model...")
+            self.model.create_chat_completion(
+                messages=[{"role": "user", "content": "Hello"}],
+                max_tokens=1,
+                temperature=0.0,
+                stream=False,
+            )
+            logger.debug(f"🔍 Debug: Model warmup completed successfully")
+        except Exception as e:
+            logger.warning(f"⚠️  Debug: Model warmup failed: {e}")
+
+    # =========================================================================
+    # ADAPTER SUPPORT (constructor-based reload)
+    # =========================================================================
+
+    def _check_adapter_compatibility(self, adapter_dir) -> bool:
+        """Check if adapter was trained for the currently loaded base model.
+
+        Reads adapter_config.json and compares base_model_name_or_path against
+        the loaded model path. This prevents loading a Hermes adapter on a Qwen
+        model (or similar architecture mismatches).
+
+        Returns:
+            True if compatible or check cannot be performed, False if incompatible.
+        """
+        import json
+        from pathlib import Path
+
+        config_path = Path(adapter_dir) / "adapter_config.json"
+        if not config_path.is_file():
+            logger.debug("No adapter_config.json found, skipping compatibility check")
+            return True
+
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Failed to read adapter_config.json: {e}")
+            return True
+
+        adapter_base = config.get("base_model_name_or_path", "")
+        if not adapter_base:
+            return True
+
+        # Normalize for comparison: extract the model identifier
+        # e.g. "NousResearch/Hermes-3-Llama-3.1-8B" -> "hermes-3-llama-3.1-8b"
+        adapter_base_lower = adapter_base.rsplit("/", 1)[-1].lower()
+        model_path_lower = self.model_path.rsplit("/", 1)[-1].lower()
+
+        # Check if the adapter's base model name appears in the loaded model path
+        # or vice versa (handles GGUF filenames like "Hermes-3-Llama-3.1-8B-Q4_K_M.gguf")
+        compatible = (
+            adapter_base_lower in model_path_lower
+            or model_path_lower.replace(".gguf", "").replace("-", "").startswith(
+                adapter_base_lower.replace("-", "")[:20]
+            )
+        )
+
+        if not compatible:
+            logger.warning(
+                "Adapter/model mismatch: adapter trained on '%s', loaded model is '%s'",
+                adapter_base,
+                self.model_path,
+            )
+        return compatible
+
+    def _resolve_gguf_adapter(self, adapter_hash: str) -> Optional[str]:
+        """Resolve adapter hash to a GGUF adapter file path.
+
+        Looks up the adapter via adapter_cache, then checks for:
+        1. Adapter compatibility with the loaded base model
+        2. gguf/adapter.gguf (preferred, from dual-format training)
+        3. Any *.gguf file in the adapter directory root (fallback)
+
+        Returns:
+            Path to the .gguf adapter file, or None if not found.
+        """
+        from services import adapter_cache
+
+        adapter_dir = adapter_cache.get_adapter_path(adapter_hash)
+        if adapter_dir is None:
+            logger.warning(f"Adapter {adapter_hash} not found in cache/storage")
+            return None
+
+        # Check adapter was trained for the currently loaded model
+        if not self._check_adapter_compatibility(adapter_dir):
+            logger.warning(f"Skipping incompatible adapter {adapter_hash} for model {self.model_path}")
+            return None
+
+        # Preferred: gguf/adapter.gguf from dual-format training output
+        gguf_subdir = adapter_dir / "gguf" / "adapter.gguf"
+        if gguf_subdir.is_file():
+            logger.debug(f"Resolved GGUF adapter: {gguf_subdir}")
+            return str(gguf_subdir)
+
+        # Fallback: any *.gguf file in the adapter root
+        for candidate in adapter_dir.glob("*.gguf"):
+            if candidate.is_file():
+                logger.debug(f"Resolved GGUF adapter (fallback): {candidate}")
+                return str(candidate)
+
+        logger.warning(f"No .gguf adapter file found in {adapter_dir}")
+        return None
+
+    def _reload_with_adapter(self, lora_path: Optional[str], lora_scale: float = 1.0) -> None:
+        """Destroy the current model and recreate it with (or without) a LoRA adapter.
+
+        Must be called with self._lock held.
+        """
+        logger.info(f"🔄 Reloading model {'with adapter ' + lora_path if lora_path else 'without adapter'}...")
+        start = time.time()
+
+        # Destroy current model
+        if self.model is not None:
+            del self.model
+            self.model = None
+
+        from llama_cpp import Llama
+
+        ctor_kwargs = dict(self._llama_init_kwargs)
+        if lora_path:
+            ctor_kwargs["lora_path"] = lora_path
+            ctor_kwargs["lora_scale"] = lora_scale
+
+        self.model = Llama(**ctor_kwargs)
+        self._warmup()
+
+        elapsed = time.time() - start
+        logger.info(f"✅ Model reloaded in {elapsed:.2f}s")
+
+    def load_adapter(self, adapter_path: str, scale: float = 1.0) -> None:
+        """Load a LoRA adapter by reloading the model with the adapter baked in."""
+        with self._lock:
+            self._reload_with_adapter(adapter_path, scale)
+            self._current_adapter_path = adapter_path
+            self._current_adapter_scale = scale
+
+    def remove_adapter(self) -> None:
+        """Remove the current adapter by reloading the base model."""
+        with self._lock:
+            if self._current_adapter_path is None:
+                return
+            self._reload_with_adapter(None)
+            self._current_adapter_hash = None
+            self._current_adapter_path = None
+            self._current_adapter_scale = 1.0
+
+    def get_current_adapter(self) -> Optional[str]:
+        """Return the currently loaded adapter path, or None if base model."""
+        return self._current_adapter_path
+
+    # =========================================================================
+    # CHAT METHODS
+    # =========================================================================
+
+    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+        """Chat method with temperature support"""
+        return self.chat_with_temperature(messages, temperature)
+
+    def chat_with_temperature(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+        """Delegate to appropriate backend with thread safety"""
+        # Use thread lock to prevent concurrent access issues
+        with self._lock:
+            if self.inference_engine == "vllm":
+                return self._chat_vllm(messages, temperature)
+            else:
+                return self._chat_llama_cpp(messages, temperature)
+
+    def _chat_vllm(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+        """Chat using vLLM backend"""
+        logger.debug(f"🚀 vLLM chat with {len(messages)} messages, temperature: {temperature}")
+
+        try:
+            response_text, usage = self.backend.generate(
+                messages=messages,
+                temperature=temperature,
+                    max_tokens=get_int_setting("inference.general.max_tokens", "JARVIS_MAX_TOKENS", 7000),
+                top_p=0.95
+            )
+
+            # Update last usage
+            self.last_usage = time.time()
+
+            return response_text
+
+        except Exception as e:
+            logger.error(f"❌ vLLM chat error: {e}")
+            raise
+
+    def _chat_llama_cpp(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+        # Start timing
+        start_time = time.time()
+
+        # Enhanced logging for prefix matching diagnosis
+        logger.debug(f"🔍 PREFIX DEBUG: Starting chat with {len(messages)} messages")
+        logger.debug(f"🔍 PREFIX DEBUG: Temperature: {temperature}")
+
+        # Log each message in detail for prefix matching analysis
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            content_preview = content[:100] + "..." if len(content) > 100 else content
+            logger.debug(f"🔍 PREFIX DEBUG: Message {i+1} [{role}]: {content_preview}")
+            logger.debug(f"🔍 PREFIX DEBUG: Message {i+1} length: {len(content)} chars, {len(content.split())} words")
+
+        # Capture initial power metrics (if available)
+        initial_gpu_power = self.power_metrics.gpu_power
+        initial_cpu_power = self.power_metrics.cpu_power
+
+        # llama_cpp supports structured chat messages directly
+        logger.debug(f"🔍 PREFIX DEBUG: Calling LLaMA.cpp create_chat_completion...")
+
+        # Log the exact messages being sent to help diagnose prefix matching
+        logger.debug(f"🔍 PREFIX DEBUG: Raw messages being sent to LLaMA.cpp:")
+        for i, msg in enumerate(messages):
+            logger.debug(f"🔍 PREFIX DEBUG: Raw[{i}]: {msg}")
+
+        try:
+            # llama.cpp's create_chat_completion automatically detects chat format from the model
+            response = self.model.create_chat_completion(
+                messages=messages,  # type: ignore
+                temperature=temperature,
+                max_tokens=self.max_tokens,  # Use configurable max tokens
+                top_p=self.top_p,  # Use configurable top_p
+                top_k=self.top_k,  # Use configurable top_k
+                repeat_penalty=self.repeat_penalty,  # Use configurable repeat penalty
+                stream=False,
+                mirostat_mode=self.mirostat_mode,  # Use configurable mirostat mode
+                mirostat_tau=self.mirostat_tau,  # Use configurable mirostat tau
+                mirostat_eta=self.mirostat_eta,  # Use configurable mirostat eta
+            )
+            logger.debug(f"🔍 PREFIX DEBUG: LLaMA.cpp response received")
+
+        except Exception as e:
+            logger.warning(f"⚠️  Error during inference: {e}")
+            # Try to recover by reinitializing the model context
+            try:
+                logger.info(f"🔄 Attempting to recover from inference error...")
+                # Force a small warmup inference to reset context
+                self.model.create_chat_completion(
+                    messages=[{"role": "user", "content": "test"}],
+                    max_tokens=1,
+                    temperature=0.0,
+                    stream=False,
+                )
+                logger.info(f"✅ Recovery successful, retrying original request...")
+                # Retry the original request
+                response = self.model.create_chat_completion(
+                    messages=messages,  # type: ignore
+                    temperature=temperature,
+                    max_tokens=self.max_tokens,  # Use configurable max tokens
+                    top_p=self.top_p,  # Use configurable top_p
+                    top_k=self.top_k,  # Use configurable top_k
+                    repeat_penalty=self.repeat_penalty,  # Use configurable repeat penalty
+                    stream=False,
+                )
+            except Exception as retry_e:
+                logger.error(f"❌ Recovery failed: {retry_e}")
+                return ""
+
+        # Calculate timing
+        end_time = time.time()
+        total_time = end_time - start_time
+
+        # Capture final power metrics (if available)
+        final_gpu_power = self.power_metrics.gpu_power
+        final_cpu_power = self.power_metrics.cpu_power
+        avg_gpu_power = (initial_gpu_power + final_gpu_power) / 2
+        avg_cpu_power = (initial_cpu_power + final_cpu_power) / 2
+
+        # Extract token stats and print performance metrics
+        try:
+            content = response["choices"][0]["message"]["content"] or ""  # type: ignore
+            usage = response.get("usage", {})  # type: ignore
+
+            # Store usage information for OpenAI-style response
+            self.last_usage = usage
+
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            total_tokens = usage.get("total_tokens", 0)
+
+            # Calculate tokens per second
+            tokens_per_second = completion_tokens / total_time if total_time > 0 else 0
+
+            # Calculate first token latency (approximate)
+            first_token_time = total_time / completion_tokens if completion_tokens > 0 else 0
+
+            # Enhanced performance stats
+            logger.debug(f"🚀 Generated {completion_tokens} tokens in {total_time:.2f}s ({tokens_per_second:.1f} tok/s)")
+            logger.debug(f"📊 Prompt: {prompt_tokens} tokens | Completion: {completion_tokens} tokens | Total: {total_tokens} tokens")
+            logger.debug(f"⚡ First token latency: ~{first_token_time*1000:.0f}ms")
+            logger.debug(f"🌡️  Temperature: {temperature}")
+
+            # Power metrics (if available)
+            if self.power_metrics.sudo_available:
+                logger.debug(f"🔋 GPU Power: {avg_gpu_power:.0f}mW ({avg_gpu_power/1000:.1f}W) | CPU Power: {avg_cpu_power:.0f}mW ({avg_cpu_power/1000:.1f}W)")
+                logger.debug(f"⚙️  GPU: {self.power_metrics.gpu_frequency}MHz @ {self.power_metrics.gpu_utilization:.1f}% utilization")
+
+                # Energy efficiency
+                if tokens_per_second > 0:
+                    energy_per_token = (avg_gpu_power + avg_cpu_power) / tokens_per_second
+                    logger.debug(f"🌱 Energy efficiency: {energy_per_token:.1f}mW per token/s")
+            else:
+                logger.debug("💡 For power monitoring, run: sudo powermetrics --samplers gpu_power,cpu_power --sample-count 1 -n 1")
+
+            return content
+
+        except (KeyError, IndexError, TypeError):
+            return ""
+
+    def process_context(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Process context without generating a response - for warm-up purposes"""
+        try:
+            # Use a minimal inference to process the context
+            # This creates internal representations that can be reused
+            response = self.model.create_chat_completion(
+                messages=messages,
+                temperature=0.0,  # Deterministic
+                max_tokens=1,     # Minimal tokens
+                top_p=1.0,
+                top_k=1,
+                repeat_penalty=1.0,
+                stream=False,
+            )
+
+            # Extract the internal context representation
+            # This is a simplified approach - in practice, you might want to
+            # extract embeddings or other internal representations
+            processed_context = {
+                "messages": messages,
+                "context_processed": True,
+                "timestamp": time.time()
+            }
+
+            logger.debug(f"🔥 Context processed for {len(messages)} messages")
+            return processed_context
+
+        except Exception as e:
+            logger.warning(f"⚠️  Error processing context: {e}")
+            # Fallback to storing raw messages
+            return {
+                "messages": messages,
+                "context_processed": False,
+                "timestamp": time.time()
+            }
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics for monitoring"""
+        total_requests = self.cache_hits + self.cache_misses
+        hit_rate = (self.cache_hits / total_requests * 100) if total_requests > 0 else 0
+
+        return {
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "hit_rate": hit_rate,
+            "cache_size": len(self.context_cache),
+            "max_cache_size": self.max_cache_size
+        }
+
+    def clear_cache(self):
+        """Clear the context cache to free memory"""
+        self.context_cache.clear()
+        self.cache_hits = 0
+        self.cache_misses = 0
+        logger.debug("🧹 Context cache cleared")
+
+    def _get_context_key(self, messages: List[Dict[str, str]]) -> str:
+        """Generate a cache key for the message context"""
+        # Create a hash of the message content for caching
+        import hashlib
+        content = "".join([msg.get("content", "") for msg in messages])
+        return hashlib.md5(content.encode()).hexdigest()
+
+    def _manage_cache_size(self):
+        """Manage cache size to prevent memory issues"""
+        if len(self.context_cache) > self.max_cache_size:
+            # Remove oldest entries (simple FIFO)
+            keys_to_remove = list(self.context_cache.keys())[:len(self.context_cache) - self.max_cache_size]
+            for key in keys_to_remove:
+                del self.context_cache[key]
+            logger.debug(f"🧹 Removed {len(keys_to_remove)} old cache entries")
+
+    def unload(self):
+        """Unload the model and clean up resources"""
+        if hasattr(self, 'model'):
+            del self.model
+            self.model = None
+        if hasattr(self, 'power_metrics'):
+            self.power_metrics.stop_monitoring()
+        self._current_adapter_hash = None
+        self._current_adapter_path = None
+        self._current_adapter_scale = 1.0
+        logger.info(f"🔄 Unloaded model: {self.model_path}")
+
+    def __del__(self):
+        """Clean up power monitoring on destruction"""
+        if hasattr(self, 'power_metrics'):
+            self.power_metrics.stop_monitoring()
+
+    @staticmethod
+    def _apply_no_think_prefill(
+        legacy_messages: List[Dict[str, str]],
+        reasoning_budget: Optional[int] = None,
+    ) -> List[Dict[str, str]]:
+        r"""Force a reasoning model (Qwen3.5) to SKIP its <think> block by seeding
+        the assistant turn with an already-closed, empty one.
+
+        ══════════════════════════════════════════════════════════════════════════
+        WHY THIS EXISTS — read this before "cleaning it up" (it is load-bearing)
+        ══════════════════════════════════════════════════════════════════════════
+        Qwen3.5 is a *reasoning* model. Its chat template opens a `<think>\n` block
+        on EVERY generation and the model fills it with a multi-hundred-token
+        "Thinking Process:" monologue before it answers. On the VOICE hot path that
+        is catastrophic on two fronts:
+          1. Latency — it's the dominant cost (several seconds of hidden decode,
+             generated twice when the force-tool-calls guard retries), and
+          2. Silence — if the think block runs past max_tokens, the assistant
+             message comes back EMPTY, so the user hears NOTHING at all.
+
+        The documented cure is llama.cpp's `--reasoning-budget 0` (optionally with
+        `--chat-template-kwargs '{"enable_thinking":false}'`). BUT those are
+        **llama-server** flags. We serve in-process via llama-cpp-python, and its
+        `create_chat_completion` (verified on 0.3.34) exposes NEITHER a
+        reasoning-budget NOR a chat_template_kwargs / enable_thinking parameter —
+        there is simply no knob to flip. And the soft `/no_think` control token that
+        works on Qwen3-8B is *unreliable* on Qwen3.5 (upstream: ggml-org/llama.cpp
+        issue #20182) — the model cheerfully ignores it and thinks anyway.
+
+        What DOES reliably work (measured directly against our loaded 9B): seed the
+        assistant turn with an empty, already-closed think block —
+        `<think>\n\n</think>\n\n` — which is EXACTLY what Qwen's own
+        `enable_thinking=false` template branch emits. Given a system prompt that
+        firmly pins the output format (ours always does: the JSON
+        `{"message":...,"tool_calls":[...]}` contract), the model continues straight
+        into the answer with ZERO reasoning. Measured on the live 9B for
+        "what are my dogs named?": 126 → 13 completion tokens, 0 think tokens,
+        consistent across direct-answer AND tool queries.
+
+        We deliberately keep the prefill FORMAT-AGNOSTIC (empty block, no `{`
+        anchor): a `{` anchor also suppresses thinking but couples this server to
+        the JSON output shape and pushed the model toward message-only replies
+        (hurting tool calls). The empty block leaves tool-calling free and relies on
+        the caller's format directive to anchor the answer — which our prompts
+        always provide.
+
+        SELF-GATING via `/no_think`: ONLY our Qwen3-family prompt providers append
+        `/no_think` to the user turn (they do so whenever `model.include_thinking`
+        is off). Non-thinking models (Llama, Mistral, …) never carry that token, so
+        keying off its presence makes this a strict no-op for every model except the
+        exact one that needs it — no per-model config, no new request field, no
+        cross-service plumbing. The empty `<think></think>` that comes back in the
+        content is removed by the prompt provider's existing think-stripper before
+        it can reach TTS.
+
+        A per-request `reasoning_budget=0` triggers the same prefill — that is the
+        backend-agnostic "thinking off" contract (queue jobs and REST callers use
+        it), and on this in-process path the prefill is the only mechanism that
+        actually implements it. Any other budget value is ignored here (no way to
+        cap thinking tokens through create_chat_completion).
+
+        Escalation path if this ever proves flaky: serve the 9B via llama-server with
+        `--reasoning-budget 0` (guaranteed, but a bigger serving-architecture change).
+        ══════════════════════════════════════════════════════════════════════════
+        """
+        if not legacy_messages:
+            return legacy_messages
+        # Only Qwen3 providers emit `/no_think`; its presence == "caller wants no
+        # chain-of-thought". Safe, self-gating, model-agnostic. reasoning_budget=0
+        # is the explicit request-level equivalent.
+        wants_no_think = reasoning_budget == 0 or any(
+            m.get("role") == "user" and "/no_think" in (m.get("content") or "")
+            for m in legacy_messages
+        )
+        if not wants_no_think:
+            return legacy_messages
+        # Idempotent: never stack a second prefill (e.g. if a caller already primed).
+        last = legacy_messages[-1]
+        if last.get("role") == "assistant" and "</think>" in (last.get("content") or ""):
+            return legacy_messages
+        return [*legacy_messages, {"role": "assistant", "content": "<think>\n\n</think>\n\n"}]
+
+    def generate_text_chat(
+        self,
+        model_cfg: Any,
+        messages: List[NormalizedMessage],
+        params: GenerationParams,
+    ) -> ChatResult:
+        """
+        Generate text chat response using GGUF backend.
+        Supports both llama.cpp and vLLM inference engines.
+        Handles per-request adapter switching via model reload.
+        """
+        # Convert NormalizedMessage to legacy dict format
+        legacy_messages = []
+        for msg in messages:
+            # Concatenate all text parts
+            text_content = " ".join(
+                part.text for part in msg.content if isinstance(part, TextPart)
+            )
+            legacy_messages.append({"role": msg.role, "content": text_content})
+
+        # Reasoning-suppression prefill for Qwen3.5 (see _apply_no_think_prefill).
+        legacy_messages = self._apply_no_think_prefill(legacy_messages, params.reasoning_budget)
+
+        effective_max_tokens = params.max_tokens or self.max_tokens
+
+        # Use thread lock for thread safety
+        with self._lock:
+            # Handle adapter switching for llama.cpp engine
+            if self.inference_engine == "llama_cpp" and params.adapter_settings:
+                self._handle_adapter_switch(params.adapter_settings)
+
+            gen_start = time.time()
+
+            if self.inference_engine == "vllm":
+                # Use vLLM backend
+                response_text, usage = self.backend.generate(
+                    messages=legacy_messages,
+                    temperature=params.temperature,
+                    max_tokens=effective_max_tokens,
+                    top_p=params.top_p if params.top_p is not None else self.top_p,
+                    seed=params.seed,
+                    # Pass response_format for JSON support
+                    response_format=params.response_format,
+                )
+                # vLLM returns usage dict, but we need to store it
+                if isinstance(usage, dict):
+                    self.last_usage = usage
+
+                elapsed = time.time() - gen_start
+                comp = usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0
+                logger.info(f"⏱️  vLLM {comp} tokens in {elapsed:.2f}s ({comp/elapsed:.0f} tok/s, max_tokens={effective_max_tokens})")
+
+                return ChatResult(content=response_text, usage=usage, tool_calls=None, finish_reason="stop")
+            else:
+                # Use llama.cpp backend
+                # Note: llama.cpp's create_chat_completion automatically detects chat format from the model
+                #
+                # `seed`: llama-cpp-python otherwise reuses the seed set at
+                # Llama() init, which makes temperature sampling produce the
+                # same output for identical prompts (wake-response, chat, etc.).
+                # Pass a fresh random seed per request so temperature>0 actually
+                # varies. No-op for temperature=0 (greedy).
+                completion_kwargs = {
+                    "messages": legacy_messages,  # type: ignore
+                    "temperature": params.temperature,
+                    "max_tokens": effective_max_tokens,
+                    "top_p": params.top_p if params.top_p is not None else self.top_p,
+                    "top_k": self.top_k,
+                    "repeat_penalty": self.repeat_penalty,
+                    "stream": False,
+                    "seed": params.seed if params.seed is not None else random.randint(0, 2**32 - 1),
+                    "mirostat_mode": self.mirostat_mode,
+                    "mirostat_tau": self.mirostat_tau,
+                    "mirostat_eta": self.mirostat_eta,
+                }
+                if self.stop_tokens:
+                    completion_kwargs["stop"] = self.stop_tokens
+                # Native tool calling: pass tools to llama-cpp-python
+                if params.tools:
+                    completion_kwargs["tools"] = params.tools
+                    if params.tool_choice is not None:
+                        completion_kwargs["tool_choice"] = params.tool_choice
+                    logger.info("🔧 Native tool calling enabled for llama.cpp request (%d tools)", len(params.tools))
+                response = self.model.create_chat_completion(**completion_kwargs)
+
+                content = response["choices"][0]["message"].get("content") or ""  # type: ignore
+                tool_calls_raw = response["choices"][0]["message"].get("tool_calls")  # type: ignore
+                finish_reason = response["choices"][0].get("finish_reason", "stop")  # type: ignore
+                usage = response.get("usage", {})  # type: ignore
+                self.last_usage = usage
+
+                elapsed = time.time() - gen_start
+                comp = usage.get("completion_tokens", 0)
+                prompt_t = usage.get("prompt_tokens", 0)
+                tok_s = comp / elapsed if elapsed > 0 else 0
+                logger.info(f"⏱️  llama.cpp {comp} completion + {prompt_t} prompt tokens in {elapsed:.2f}s ({tok_s:.0f} tok/s, max_tokens={effective_max_tokens})")
+
+                return ChatResult(
+                    content=content,
+                    usage=usage,
+                    tool_calls=tool_calls_raw,
+                    finish_reason=finish_reason,
+                )
+
+    def generate_text_chat_stream(
+        self,
+        model_cfg: Any,
+        messages: List[NormalizedMessage],
+        params: GenerationParams,
+    ) -> Generator[Dict[str, Any], None, None]:
+        """Stream chat completion token-by-token.
+
+        Yields dicts:
+        - {"delta": "token"} for each token
+        - {"done": True, "content": "...", "usage": {...}, ...} as final event
+
+        Only supported for the llama.cpp engine.
+        """
+        if self.inference_engine != "llama_cpp":
+            raise NotImplementedError("Streaming only supported for llama.cpp engine")
+
+        # Convert NormalizedMessage to legacy dict format
+        legacy_messages: list[dict[str, str]] = []
+        for msg in messages:
+            text_content = " ".join(
+                part.text for part in msg.content if isinstance(part, TextPart)
+            )
+            legacy_messages.append({"role": msg.role, "content": text_content})
+
+        # Reasoning-suppression prefill for Qwen3.5 (see _apply_no_think_prefill).
+        legacy_messages = self._apply_no_think_prefill(legacy_messages, params.reasoning_budget)
+
+        effective_max_tokens: int = params.max_tokens or self.max_tokens
+
+        with self._lock:
+            if params.adapter_settings:
+                self._handle_adapter_switch(params.adapter_settings)
+
+            gen_start = time.time()
+
+            completion_kwargs: dict[str, Any] = {
+                "messages": legacy_messages,
+                "temperature": params.temperature,
+                "max_tokens": effective_max_tokens,
+                "top_p": params.top_p if params.top_p is not None else self.top_p,
+                "top_k": self.top_k,
+                "repeat_penalty": self.repeat_penalty,
+                "stream": True,
+                # Fresh per-request seed — see non-streaming path above.
+                "seed": params.seed if params.seed is not None else random.randint(0, 2**32 - 1),
+                "mirostat_mode": self.mirostat_mode,
+                "mirostat_tau": self.mirostat_tau,
+                "mirostat_eta": self.mirostat_eta,
+            }
+            if self.stop_tokens:
+                completion_kwargs["stop"] = self.stop_tokens
+
+            full_content = ""
+            finish_reason = "stop"
+
+            for chunk in self.model.create_chat_completion(**completion_kwargs):
+                choice = chunk["choices"][0]  # type: ignore
+                delta = choice.get("delta", {})
+                delta_content = delta.get("content")
+
+                if delta_content:
+                    full_content += delta_content
+                    yield {"delta": delta_content}
+
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+
+            elapsed = time.time() - gen_start
+            usage = chunk.get("usage") if chunk else {}  # type: ignore
+            if not usage:
+                # llama-cpp-python doesn't always provide usage in streaming mode
+                # Estimate from content length
+                usage = {}
+
+            self.last_usage = usage
+
+            comp = usage.get("completion_tokens", 0)
+            prompt_t = usage.get("prompt_tokens", 0)
+            tok_s = comp / elapsed if elapsed > 0 and comp > 0 else 0
+            logger.info(
+                f"⏱️  llama.cpp stream {comp} completion + {prompt_t} prompt tokens "
+                f"in {elapsed:.2f}s ({tok_s:.0f} tok/s)"
+            )
+
+            yield {
+                "done": True,
+                "content": full_content,
+                "usage": usage,
+                "tool_calls": None,
+                "finish_reason": finish_reason,
+            }
+
+    def _handle_adapter_switch(self, adapter_settings: dict) -> None:
+        """Check adapter_settings and reload model if adapter changed.
+
+        Must be called with self._lock held.
+
+        If no adapter is requested (hash is None/empty or disabled), any
+        currently loaded adapter is unloaded to restore the base model.
+        """
+        adapter_hash = adapter_settings.get("hash")
+        adapter_scale = adapter_settings.get("scale", 1.0)
+        adapter_enabled = adapter_settings.get("enabled", True)
+
+        if not adapter_hash or not adapter_enabled:
+            # No adapter requested — unload current adapter if one is active
+            if self._current_adapter_path is not None:
+                logger.info("🧩 [GGUF] No adapter requested, unloading current adapter")
+                self._reload_with_adapter(None)
+                self._current_adapter_hash = None
+                self._current_adapter_path = None
+                self._current_adapter_scale = 1.0
+            return
+
+        # Same adapter already loaded — skip reload
+        if adapter_hash == self._current_adapter_hash:
+            logger.debug(f"🧩 [GGUF] Adapter already loaded: {adapter_hash[:8]}")
+            return
+
+        # Resolve adapter hash to a .gguf file path
+        gguf_path = self._resolve_gguf_adapter(adapter_hash)
+        if gguf_path is None:
+            logger.warning(f"⚠️  [GGUF] Adapter not found: hash={adapter_hash}")
+            return
+
+        # Reload model with the new adapter
+        logger.info(f"🧩 [GGUF] Switching adapter: {adapter_hash[:8]} (scale={adapter_scale})")
+        self._reload_with_adapter(gguf_path, adapter_scale)
+        self._current_adapter_hash = adapter_hash
+        self._current_adapter_path = gguf_path
+        self._current_adapter_scale = adapter_scale

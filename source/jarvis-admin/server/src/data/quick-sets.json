@@ -1,0 +1,104 @@
+{
+  "presets": [
+    {
+      "id": "qwen25-7b",
+      "name": "Qwen 2.5 7B",
+      "family": "Qwen",
+      "description": "Solid all-around model. Good balance of speed and accuracy for voice commands.",
+      "chatFormat": "chatml",
+      "promptProvider": "Qwen25MediumUntrained",
+      "defaultBackend": "GGUF",
+      "defaultContextWindow": 32768
+    },
+    {
+      "id": "qwen25-14b",
+      "name": "Qwen 2.5 14B",
+      "family": "Qwen",
+      "description": "Stronger reasoning with more parameters. Needs ~10GB RAM for Q4 quantization.",
+      "chatFormat": "chatml",
+      "promptProvider": "Qwen25_14B_Untrained",
+      "defaultBackend": "GGUF",
+      "defaultContextWindow": 32768
+    },
+    {
+      "id": "qwen3-8b",
+      "name": "Qwen 3 8B",
+      "family": "Qwen",
+      "description": "Latest Qwen generation, 8B dense model with thinking disabled for speed.",
+      "chatFormat": "chatml",
+      "promptProvider": "Qwen3_8B_Compressed",
+      "defaultBackend": "GGUF",
+      "defaultContextWindow": 32768
+    },
+    {
+      "id": "qwen3-14b",
+      "name": "Qwen 3 14B",
+      "family": "Qwen",
+      "description": "Qwen 3 dense 14B. Strong tool calling and instruction following.",
+      "chatFormat": "chatml",
+      "promptProvider": "Qwen3_14B_Compressed",
+      "defaultBackend": "GGUF",
+      "defaultContextWindow": 32768
+    },
+    {
+      "id": "qwen3-30b-moe",
+      "name": "Qwen 3 30B MoE",
+      "family": "Qwen",
+      "description": "Mixture-of-experts: 30B total, 3.3B active. Fast inference with large model quality.",
+      "chatFormat": "chatml",
+      "promptProvider": "Qwen3LargeUntrained",
+      "defaultBackend": "GGUF",
+      "defaultContextWindow": 32768
+    },
+    {
+      "id": "llama31-8b",
+      "name": "Llama 3.1 8B",
+      "family": "Llama",
+      "description": "Meta's Llama 3.1 8B instruct. Well-tested, wide community support.",
+      "chatFormat": "llama-3",
+      "promptProvider": "Llama31MediumUntrained",
+      "defaultBackend": "GGUF",
+      "defaultContextWindow": 8192
+    },
+    {
+      "id": "llama33-thinking-8b",
+      "name": "Llama 3.3 8B (Thinking)",
+      "family": "Llama",
+      "description": "Llama 3.3 8B fine-tuned on Claude Haiku 4.5 reasoning traces. Auto-thinks on complex prompts; same <function=...> tool format as Llama 3.1.",
+      "chatFormat": "llama-3",
+      "promptProvider": "Llama33ThinkingMediumUntrained",
+      "defaultBackend": "GGUF",
+      "defaultContextWindow": 16384
+    },
+    {
+      "id": "gemma2-9b",
+      "name": "Gemma 2 9B",
+      "family": "Gemma",
+      "description": "Google Gemma 2 9B. Strong general reasoning with efficient architecture.",
+      "chatFormat": "chatml",
+      "promptProvider": "Gemma2MediumUntrained",
+      "defaultBackend": "GGUF",
+      "defaultContextWindow": 8192
+    },
+    {
+      "id": "gemma3-12b",
+      "name": "Gemma 3 12B",
+      "family": "Gemma",
+      "description": "Google Gemma 3 with improved instruction following over Gemma 2.",
+      "chatFormat": "chatml",
+      "promptProvider": "Gemma3MediumUntrained",
+      "defaultBackend": "GGUF",
+      "defaultContextWindow": 8192
+    },
+    {
+      "id": "gemma4-27b",
+      "name": "Gemma 4 27B",
+      "family": "Gemma",
+      "description": "Google Gemma 4 with native tool calling. Uses custom chat format with thinking disabled.",
+      "chatFormat": "gemma4",
+      "promptProvider": "Gemma4_31B_Untrained",
+      "defaultBackend": "GGUF",
+      "defaultContextWindow": 8192
+    }
+  ]
+}

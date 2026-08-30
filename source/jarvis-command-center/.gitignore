@@ -1,0 +1,105 @@
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+test_env/
+
+# VS Code and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+*.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# SQLite databases
+*.db
+data/
+*.sqlite
+*.sqlite3
+
+# Docker
+*.log
+docker-compose.override.yml
+
+# OS Files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Test cache
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Home Assistant specific files
+areas.json
+devices.json
+entities.json
+services.json
+
+# Debug and temporary files
+temp_*.py
+*.tmp
+*.bak
+temp/
+temp/tool_classifier.bin
+temp/tool_router_extra_training.jsonl
+temp/tool_router_training.jsonl
+temp/test_results*.json
+
+# Training data bloat (large generated datasets, kept on disk only)
+training-data/**/*.jsonl
+
+# Logs
+logs/
+*.log
+
+.continue/
+.venv/
+temp/adapter_training_*.jsonl

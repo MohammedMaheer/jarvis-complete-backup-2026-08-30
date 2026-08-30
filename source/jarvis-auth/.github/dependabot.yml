@@ -1,0 +1,28 @@
+# Dependency updates. Added 2026-07-14: the project had no Dependabot,
+# no lockfile audit, and no automated pin bumps — a reviewer on the launch
+# thread correctly called that out.
+#
+# github-actions is the one that matters most here: third-party actions were
+# floating on tags in jobs that hold packages:write, so a tag repoint could
+# run attacker code with a token that can publish images.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # bcrypt 5.x raises on >72-byte inputs where 4.x truncated, which breaks
+      # passlib 1.7.4's bcrypt backend probe. passlib is abandoned, so pin to
+      # bcrypt 4.x until we migrate off passlib. (See closed PR #21.)
+      - dependency-name: "bcrypt"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

@@ -1,0 +1,582 @@
+name: jarvis
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: jarvis-postgres
+    ports:
+      - "${JARVIS_INFRA_BIND_HOST:-127.0.0.1}:${POSTGRES_PORT:-5435}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-jarvis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-jarvis_config}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-jarvis}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - jarvis-postgres-data:/var/lib/postgresql/data
+      - ${INIT_DB_PATH:-./init-db.sh}:/docker-entrypoint-initdb.d/init-db.sh
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: jarvis-loki
+    ports:
+      - "${JARVIS_INFRA_BIND_HOST:-127.0.0.1}:${LOKI_PORT:-3100}:3100"
+    volumes:
+      - jarvis-loki-data:/loki
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: jarvis-mosquitto
+    ports:
+      - "${MOSQUITTO_PORT:-1884}:1884"
+      - "${MOSQUITTO_WS_PORT:-9883}:9001"
+    environment:
+      MQTT_USERNAME: ${MQTT_USERNAME:-jarvis}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      MQTT_ALLOW_ANON: ${MQTT_ALLOW_ANON:-true}
+    command:
+      - sh
+      - -c
+      - |
+        rm -f /tmp/pwfile
+        mosquitto_passwd -b -c /tmp/pwfile "$$MQTT_USERNAME" "$$MQTT_PASSWORD"
+        chown mosquitto:mosquitto /tmp/pwfile
+        {
+          echo "listener 1884"
+          echo "protocol mqtt"
+          echo "listener 9001"
+          echo "protocol websockets"
+          echo "allow_anonymous $$MQTT_ALLOW_ANON"
+          echo "password_file /tmp/pwfile"
+          echo "persistence true"
+          echo "persistence_location /mosquitto/data/"
+        } > /tmp/mosquitto.conf
+        exec mosquitto -c /tmp/mosquitto.conf
+    volumes:
+      - jarvis-mosquitto-data:/mosquitto/data
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: jarvis-grafana
+    ports:
+      - "${JARVIS_SERVICE_BIND_HOST:-127.0.0.1}:${GRAFANA_PORT:-3001}:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - jarvis-grafana-data:/var/lib/grafana
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: jarvis-redis
+    ports:
+      - "${JARVIS_INFRA_BIND_HOST:-127.0.0.1}:${REDIS_PORT:-6381}:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - jarvis-redis-data:/data
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  jarvis-config-service:
+    image: ghcr.io/alexberardi/jarvis-config-service:${JARVIS_IMAGE_TAG:-latest}
+    container_name: jarvis-config-service
+    ports:
+      - "${JARVIS_SERVICE_BIND_HOST:-127.0.0.1}:${CONFIG_SERVICE_PORT:-7700}:7700"
+    environment:
+      JARVIS_ENV: "production"
+      JARVIS_CONFIG_URL_STYLE: "dockerized"
+      PORT: "7700"
+      DATABASE_URL: postgresql://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_config
+      MIGRATIONS_DATABASE_URL: postgresql://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_config
+      JARVIS_CONFIG_ADMIN_TOKEN: ${JARVIS_CONFIG_ADMIN_TOKEN}
+      JARVIS_AUTH_ADMIN_TOKEN: ${JARVIS_AUTH_ADMIN_TOKEN}
+      JARVIS_AUTH_URL: http://jarvis-auth:8000
+      JARVIS_APP_ID: ${JARVIS_APP_ID_CONFIG_SERVICE:-}
+      JARVIS_APP_KEY: ${JARVIS_APP_KEY_CONFIG_SERVICE:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - python -m alembic upgrade head && exec "$@"
+      - jarvis-migrate
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7700"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7700/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  jarvis-auth:
+    image: ghcr.io/alexberardi/jarvis-auth:${JARVIS_IMAGE_TAG:-latest}
+    container_name: jarvis-auth
+    ports:
+      - "${JARVIS_SERVICE_BIND_HOST:-127.0.0.1}:${AUTH_PORT:-7701}:8000"
+    environment:
+      JARVIS_ENV: "production"
+      JARVIS_CONFIG_URL_STYLE: "dockerized"
+      PORT: "7701"
+      DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_auth
+      MIGRATIONS_DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_auth
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY}
+      JARVIS_AUTH_ADMIN_TOKEN: ${JARVIS_AUTH_ADMIN_TOKEN}
+      JARVIS_CONFIG_URL: http://jarvis-config-service:7700
+      JARVIS_APP_ID: ${JARVIS_APP_ID_AUTH:-}
+      JARVIS_APP_KEY: ${JARVIS_APP_KEY_AUTH:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jarvis-config-service:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - python -m alembic upgrade head && exec "$@"
+      - jarvis-migrate
+    command: ["uvicorn", "jarvis_auth.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  jarvis-logs:
+    image: ghcr.io/alexberardi/jarvis-logs:${JARVIS_IMAGE_TAG:-latest}
+    container_name: jarvis-logs
+    ports:
+      - "${JARVIS_SERVICE_BIND_HOST:-127.0.0.1}:${LOGS_PORT:-7702}:7702"
+    environment:
+      JARVIS_ENV: "production"
+      JARVIS_CONFIG_URL_STYLE: "dockerized"
+      LOG_SERVER_PORT: "7702"
+      LOKI_URL: http://loki:3100
+      JARVIS_CONFIG_URL: http://jarvis-config-service:7700
+      JARVIS_AUTH_BASE_URL: http://jarvis-auth:8000
+      JARVIS_APP_ID: ${JARVIS_APP_ID_LOGS:-}
+      JARVIS_APP_KEY: ${JARVIS_APP_KEY_LOGS:-}
+    depends_on:
+      loki:
+        condition: service_started
+      jarvis-auth:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7702/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  jarvis-command-center:
+    image: ghcr.io/alexberardi/jarvis-command-center:${JARVIS_IMAGE_TAG:-latest}
+    container_name: jarvis-command-center
+    ports:
+      - "${JARVIS_SERVICE_BIND_HOST:-127.0.0.1}:${COMMAND_CENTER_PORT:-7703}:8002"
+    environment:
+      JARVIS_ENV: "production"
+      JARVIS_CONFIG_URL_STYLE: "dockerized"
+      PORT: "7703"
+      DATABASE_URL: postgresql://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_command_center
+      MIGRATIONS_DATABASE_URL: postgresql://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_command_center
+      ADMIN_API_KEY: ${ADMIN_API_KEY}
+      JARVIS_AUTH_SECRET_KEY: ${AUTH_SECRET_KEY}
+      JARVIS_CONFIG_URL: http://jarvis-config-service:7700
+      JARVIS_MQTT_BROKER_URL: mqtt://mosquitto:1884
+      MQTT_USERNAME: jarvis
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      JARVIS_ADAPTER_CALLBACK_TOKEN: ${JARVIS_ADAPTER_CALLBACK_TOKEN}
+      LLM_INTERFACE_SEED: Qwen25MediumUntrained
+      JARVIS_APP_ID: ${JARVIS_APP_ID_COMMAND_CENTER:-}
+      JARVIS_APP_KEY: ${JARVIS_APP_KEY_COMMAND_CENTER:-}
+      JARVIS_AUTH_BASE_URL: http://host.docker.internal:${AUTH_PORT:-7701}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+      jarvis-auth:
+        condition: service_started
+      jarvis-config-service:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - python -m alembic upgrade head && exec "$@"
+      - jarvis-migrate
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    volumes:
+      - command-center-prompt-providers:/app/core/prompt_providers_custom
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  jarvis-admin:
+    image: ghcr.io/alexberardi/jarvis-admin:${JARVIS_IMAGE_TAG:-latest}
+    container_name: jarvis-admin
+    ports:
+      - "${JARVIS_SERVICE_BIND_HOST:-127.0.0.1}:${ADMIN_PORT:-7711}:7711"
+    environment:
+      JARVIS_ENV: "production"
+      JARVIS_CONFIG_URL_STYLE: "dockerized"
+      PORT: "7711"
+      JARVIS_CONFIG_URL: http://jarvis-config-service:7700
+      JARVIS_COMPOSE_PATH: /host/compose
+      COMMAND_CENTER_ADMIN_KEY: ${ADMIN_API_KEY}
+      HOST_OS: ${HOST_OS:-linux}
+      JARVIS_APP_ID: ${JARVIS_APP_ID_ADMIN:-}
+      JARVIS_APP_KEY: ${JARVIS_APP_KEY_ADMIN:-}
+      JARVIS_AUTH_BASE_URL: http://host.docker.internal:${AUTH_PORT:-7701}
+    depends_on:
+      jarvis-auth:
+        condition: service_started
+      jarvis-config-service:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - "${JARVIS_HOST_COMPOSE_DIR:-.}:/host/compose"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  jarvis-whisper-api:
+    image: ghcr.io/alexberardi/jarvis-whisper-api:${JARVIS_IMAGE_TAG:-latest}
+    container_name: jarvis-whisper-api
+    ports:
+      - "${JARVIS_SERVICE_BIND_HOST:-127.0.0.1}:${WHISPER_API_PORT:-7706}:7706"
+    environment:
+      JARVIS_ENV: "production"
+      JARVIS_CONFIG_URL_STYLE: "dockerized"
+      PORT: "7706"
+      DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_whisper
+      MIGRATIONS_DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_whisper
+      JARVIS_CONFIG_URL: http://jarvis-config-service:7700
+      JARVIS_AUTH_BASE_URL: http://jarvis-auth:8000
+      JARVIS_APP_ID: ${JARVIS_APP_ID_WHISPER_API:-}
+      JARVIS_APP_KEY: ${JARVIS_APP_KEY_WHISPER_API:-}
+      WHISPER_MODEL: ${WHISPER_MODEL:-/whisper-models/ggml-base.en.bin}
+      JARVIS_VOICE_DEVICE: ${JARVIS_VOICE_DEVICE:-cpu}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jarvis-auth:
+        condition: service_started
+      jarvis-config-service:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - python -m alembic upgrade head && exec "$@"
+      - jarvis-migrate
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7706"]
+    volumes:
+      - ${WHISPER_MODELS_DIR:-./whisper-models}:/whisper-models:ro
+      - whisper-voice-profiles:/app/voice_profiles
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7706/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  jarvis-tts:
+    image: ghcr.io/alexberardi/jarvis-tts:${JARVIS_IMAGE_TAG:-latest}
+    container_name: jarvis-tts
+    ports:
+      - "${JARVIS_SERVICE_BIND_HOST:-127.0.0.1}:${TTS_PORT:-7707}:7707"
+    environment:
+      JARVIS_ENV: "production"
+      JARVIS_CONFIG_URL_STYLE: "dockerized"
+      TTS_PORT: "7707"
+      DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_tts
+      MIGRATIONS_DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_tts
+      JARVIS_CONFIG_URL: http://jarvis-config-service:7700
+      TTS_PROVIDER: kokoro
+      HF_HOME: /app/models/hf_cache
+      JARVIS_APP_ID: ${JARVIS_APP_ID_TTS:-}
+      JARVIS_APP_KEY: ${JARVIS_APP_KEY_TTS:-}
+      JARVIS_AUTH_BASE_URL: http://host.docker.internal:${AUTH_PORT:-7701}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jarvis-auth:
+        condition: service_started
+      jarvis-config-service:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - python -m alembic upgrade head && exec "$@"
+      - jarvis-migrate
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7707"]
+    volumes:
+      - jarvis-tts-hf-cache:/app/models/hf_cache
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7707/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  jarvis-llm-proxy-api:
+    image: ghcr.io/alexberardi/jarvis-llm-proxy-api:${JARVIS_IMAGE_TAG:-latest}
+    container_name: jarvis-llm-proxy-api
+    ports:
+      - "${JARVIS_SERVICE_BIND_HOST:-127.0.0.1}:${LLM_PROXY_API_PORT:-7704}:7704"
+    environment:
+      JARVIS_ENV: "production"
+      JARVIS_CONFIG_URL_STYLE: "dockerized"
+      PORT: "7704"
+      DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_llm_proxy
+      MIGRATIONS_DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_llm_proxy
+      JARVIS_CONFIG_URL: http://jarvis-config-service:7700
+      JARVIS_APP_ID: ${JARVIS_APP_ID_LLM_PROXY_API:-}
+      JARVIS_APP_KEY: ${JARVIS_APP_KEY_LLM_PROXY_API:-}
+      JARVIS_AUTH_BASE_URL: http://host.docker.internal:${AUTH_PORT:-7701}
+      MODEL_SERVICE_URL: ${JARVIS_PROXY_MODEL_SERVICE_URL:-http://localhost:7705}
+      # Maheer desktop: chat inference stays on the native CUDA llama.cpp
+      # process. This container provides the OpenAI-compatible proxy and local
+      # 384-dim embedding service without loading a second GPU chat model.
+      RUN_MODEL_SERVICE: ${JARVIS_PROXY_RUN_MODEL_SERVICE:-true}
+      MODEL_SERVICE_PORT: "7705"
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      JARVIS_MODEL_BACKEND: ${JARVIS_MODEL_BACKEND:-GGUF}
+      JARVIS_MODEL_NAME: ${JARVIS_MODEL_NAME:-}
+      JARVIS_MODEL_CHAT_FORMAT: ${JARVIS_MODEL_CHAT_FORMAT:-chatml}
+      JARVIS_MODEL_CONTEXT_WINDOW: ${JARVIS_MODEL_CONTEXT_WINDOW:-32768}
+      JARVIS_LIVE_MODEL_BACKEND: ${JARVIS_LIVE_MODEL_BACKEND:-GGUF}
+      JARVIS_LIVE_MODEL_NAME: ${JARVIS_LIVE_MODEL_NAME:-}
+      JARVIS_LIVE_MODEL_CHAT_FORMAT: ${JARVIS_LIVE_MODEL_CHAT_FORMAT:-chatml}
+      JARVIS_LIVE_MODEL_CONTEXT_WINDOW: ${JARVIS_LIVE_MODEL_CONTEXT_WINDOW:-32768}
+      JARVIS_LIVE_REASONING_BUDGET: ${JARVIS_LIVE_REASONING_BUDGET:-0}
+      JARVIS_N_GPU_LAYERS: ${JARVIS_N_GPU_LAYERS:--1}
+      JARVIS_N_THREADS: ${JARVIS_N_THREADS:-10}
+      JARVIS_FLASH_ATTN: ${JARVIS_FLASH_ATTN:-true}
+      HUGGINGFACE_HUB_TOKEN: ${HUGGINGFACE_HUB_TOKEN:-}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      MODEL_SERVICE_TOKEN: ${MODEL_SERVICE_TOKEN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jarvis-auth:
+        condition: service_started
+      jarvis-config-service:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - python -m alembic upgrade head && exec "$@"
+      - jarvis-migrate
+    command: ["bash", "scripts/serve.sh"]
+    ipc: host
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${MODELS_DIR:-./.models}:/app/.models
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7704/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  llm-proxy-worker:
+    image: ghcr.io/alexberardi/jarvis-llm-proxy-api:${JARVIS_IMAGE_TAG:-latest}
+    container_name: llm-proxy-worker
+    environment:
+      JARVIS_ENV: "production"
+      DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_llm_proxy
+      MIGRATIONS_DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_llm_proxy
+      JARVIS_CONFIG_URL: http://jarvis-config-service:7700
+      JARVIS_APP_ID: ${JARVIS_APP_ID_LLM_PROXY_API:-}
+      JARVIS_APP_KEY: ${JARVIS_APP_KEY_LLM_PROXY_API:-}
+      JARVIS_AUTH_BASE_URL: http://host.docker.internal:${AUTH_PORT:-7701}
+      MODEL_SERVICE_PORT: "7705"
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      JARVIS_MODEL_BACKEND: ${JARVIS_MODEL_BACKEND:-GGUF}
+      JARVIS_MODEL_NAME: ${JARVIS_MODEL_NAME:-}
+      JARVIS_MODEL_CHAT_FORMAT: ${JARVIS_MODEL_CHAT_FORMAT:-chatml}
+      JARVIS_MODEL_CONTEXT_WINDOW: ${JARVIS_MODEL_CONTEXT_WINDOW:-32768}
+      JARVIS_LIVE_MODEL_BACKEND: ${JARVIS_LIVE_MODEL_BACKEND:-GGUF}
+      JARVIS_LIVE_MODEL_NAME: ${JARVIS_LIVE_MODEL_NAME:-}
+      JARVIS_LIVE_MODEL_CHAT_FORMAT: ${JARVIS_LIVE_MODEL_CHAT_FORMAT:-chatml}
+      JARVIS_LIVE_MODEL_CONTEXT_WINDOW: ${JARVIS_LIVE_MODEL_CONTEXT_WINDOW:-32768}
+      JARVIS_LIVE_REASONING_BUDGET: ${JARVIS_LIVE_REASONING_BUDGET:-0}
+      HUGGINGFACE_HUB_TOKEN: ${HUGGINGFACE_HUB_TOKEN:-}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      MODEL_SERVICE_TOKEN: ${MODEL_SERVICE_TOKEN}
+      LLM_PROXY_PROCESS_ROLE: worker
+      MODEL_SERVICE_URL: http://jarvis-llm-proxy-api:7705
+    command: python scripts/queue_worker.py
+    depends_on:
+      jarvis-llm-proxy-api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ipc: host
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${MODELS_DIR:-./.models}:/app/.models
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  jarvis-notifications:
+    image: ghcr.io/alexberardi/jarvis-notifications:${JARVIS_IMAGE_TAG:-latest}
+    container_name: jarvis-notifications
+    ports:
+      - "${JARVIS_SERVICE_BIND_HOST:-127.0.0.1}:${NOTIFICATIONS_PORT:-7712}:7712"
+    environment:
+      JARVIS_ENV: "production"
+      JARVIS_CONFIG_URL_STYLE: "dockerized"
+      NOTIFICATIONS_PORT: "7712"
+      DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_notifications
+      MIGRATIONS_DATABASE_URL: postgresql+psycopg2://${DB_USER:-jarvis}:${POSTGRES_PASSWORD}@postgres:5432/jarvis_notifications
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY}
+      ADMIN_API_KEY: ${ADMIN_API_KEY}
+      JARVIS_CONFIG_URL: http://jarvis-config-service:7700
+      JARVIS_AUTH_BASE_URL: http://jarvis-auth:8000
+      JARVIS_APP_ID: ${JARVIS_APP_ID_NOTIFICATIONS:-}
+      JARVIS_APP_KEY: ${JARVIS_APP_KEY_NOTIFICATIONS:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jarvis-auth:
+        condition: service_started
+      jarvis-config-service:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - python -m alembic upgrade head && exec "$@"
+      - jarvis-migrate
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7712"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7712/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+  jarvis-settings-server:
+    image: ghcr.io/alexberardi/jarvis-settings-server:${JARVIS_IMAGE_TAG:-latest}
+    container_name: jarvis-settings-server
+    ports:
+      - "${JARVIS_SERVICE_BIND_HOST:-127.0.0.1}:${SETTINGS_SERVER_PORT:-7708}:7708"
+    environment:
+      JARVIS_ENV: "production"
+      JARVIS_CONFIG_URL_STYLE: "dockerized"
+      PORT: "7708"
+      JARVIS_CONFIG_URL: http://jarvis-config-service:7700
+      JARVIS_APP_ID: ${JARVIS_APP_ID_SETTINGS_SERVER:-}
+      JARVIS_APP_KEY: ${JARVIS_APP_KEY_SETTINGS_SERVER:-}
+      JARVIS_AUTH_BASE_URL: http://host.docker.internal:${AUTH_PORT:-7701}
+      JARVIS_AUTH_SECRET_KEY: ${AUTH_SECRET_KEY}
+      JARVIS_AUTH_ALGORITHM: HS256
+    depends_on:
+      jarvis-auth:
+        condition: service_started
+      jarvis-config-service:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7708/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - jarvis
+    restart: unless-stopped
+
+networks:
+  jarvis:
+    driver: bridge
+
+volumes:
+  jarvis-postgres-data:
+  jarvis-loki-data:
+  jarvis-mosquitto-data:
+  jarvis-grafana-data:
+  jarvis-redis-data:
+  command-center-prompt-providers:
+  whisper-voice-profiles:
+  jarvis-tts-hf-cache:

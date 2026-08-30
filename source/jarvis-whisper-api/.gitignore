@@ -1,0 +1,59 @@
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# macOS system files
+.DS_Store
+
+# Logs
+*.log
+
+# VS Code config
+.vscode/
+
+# PyCharm config
+.idea/
+
+# Temporary audio and transcription files
+audio/
+*.wav.txt
+*.tmp
+
+# dotenv files
+.env
+
+# Whisper model files (optional — include if you don’t want to track models)
+models/
+
+# Prebuilt whisper.cpp binaries (built from source via setup-whisper-cpp.sh / Dockerfiles)
+bin/
+
+# Build artifacts
+build/
+*.cmake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+whisper.err
+
+# Test / coverage artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Packaging artifacts
+*.egg-info/
+dist/

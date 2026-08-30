@@ -1,0 +1,31 @@
+{
+  "name": "jarvis-admin-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc && node scripts/copy-data.mjs",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "eval:phase4": "tsx scripts/run-phase4-evals.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@fastify/static": "^10.1.3",
+    "@langchain/core": "^1.2.9",
+    "@langchain/langgraph": "^1.4.13",
+    "bcryptjs": "^3.0.3",
+    "dockerode": "^5.0.1",
+    "fastify": "^5.12.0"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^3.0.0",
+    "@types/dockerode": "^4.0.1",
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "~7.0.2",
+    "vitest": "^3.2.7"
+  }
+}

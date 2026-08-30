@@ -1,0 +1,33 @@
+{
+  "name": "@alexberardi/jarvis-admin",
+  "version": "0.1.7",
+  "description": "Admin dashboard and setup wizard for Jarvis voice assistant",
+  "type": "module",
+  "bin": {
+    "jarvis-admin": "./bin/jarvis-admin.mjs"
+  },
+  "files": [
+    "bin/",
+    "server/dist/",
+    "server/package.json",
+    "server/src/data/",
+    "server/node_modules/",
+    "public/"
+  ],
+  "keywords": [
+    "jarvis",
+    "voice-assistant",
+    "admin",
+    "dashboard",
+    "installer"
+  ],
+  "author": "Alex Berardi",
+  "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alexberardi/jarvis-admin"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

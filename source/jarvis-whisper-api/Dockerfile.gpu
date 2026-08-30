@@ -1,0 +1,201 @@
+# GPU variant: same service, CUDA-enabled torch + whisper.cpp built with cuBLAS.
+# Builds an image that runs resemblyzer (speaker recognition) on the GPU,
+# which on a single-GPU host shaves ~5-9s off every transcription request
+# vs. the slim CPU image.
+#
+# Build:  docker build -f Dockerfile.gpu -t jarvis-whisper-api:gpu .
+# Run:    docker compose -f docker-compose.gpu.yaml up -d
+#
+# Requires nvidia-container-toolkit on the host. For Apple Silicon (no
+# CUDA), keep using the default Dockerfile.
+
+# Pinned to the exact base digest v0.1.10-cuda was built against, because
+# NVIDIA pushes silent updates to the 12.4.1-devel-ubuntu22.04 tag and a
+# newer cuBLAS/cuDNN rev SIGILL'd whisper.cpp on prod during model load.
+# Bump deliberately, not via tag drift. To refresh:
+#   docker buildx imagetools inspect nvidia/cuda:12.4.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:da6791294b0b04d7e65d87b7451d6f2390b4d36225ab0701ee7dfec5769829f5 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    wget \
+    pkg-config \
+    libopenblas-dev \
+    libsndfile1 \
+    ffmpeg \
+    curl \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+# CUDA driver stub setup: the nvidia/cuda dev image ships libcuda.so (the stub)
+# but not the libcuda.so.1 SONAME the linker looks for. Create the symlink so
+# ld can resolve `NEEDED libcuda.so.1` declarations from libggml-cuda. At
+# runtime the real libcuda.so.1 is provided by nvidia-container-toolkit, so
+# the stub is link-time only.
+RUN ln -sf libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+
+WORKDIR /app
+
+# Build whisper.cpp with cuBLAS (GPU-accelerated transcription).
+#
+# WHISPER_CUDA_ARCH: CMake CUDA arch list (semicolon-separated). Default 86 (RTX 3080 Ti / Ampere).
+#   Other common values: 75 (RTX 20xx Turing), 80 (A100 Ampere), 86 (RTX 30xx),
+#   89 (RTX 40xx Ada), 90 (H100 Hopper), or a list like "80;86;89".
+#   Override at build time:  --build-arg WHISPER_CUDA_ARCH=89
+#   Or via .env on the host:  WHISPER_CUDA_ARCH=89
+#
+# We build only the whisper-cli target (skipping whisper-bench) because newer
+# whisper.cpp's bench example pulls in CUDA driver-API symbols that aren't
+# resolvable when only the libcuda stub is available at image-build time.
+ARG WHISPER_MODEL_NAME=base.en
+ARG WHISPER_CUDA_ARCH=86
+# Pin whisper.cpp to the last-green commit (see Dockerfile.rocm) so the build is
+# reproducible and immune to upstream main churn. Bump deliberately.
+ARG WHISPER_CPP_REF=84bd03a438454a82150853dce83818013c6609d2
+RUN git clone https://github.com/ggerganov/whisper.cpp.git /root/whisper.cpp \
+    && cd /root/whisper.cpp \
+    && git checkout ${WHISPER_CPP_REF} \
+    && bash ./models/download-ggml-model.sh ${WHISPER_MODEL_NAME} \
+    && cmake -B build \
+        -DGGML_CUDA=ON \
+        -DGGML_NATIVE=OFF \
+        -DCMAKE_CUDA_ARCHITECTURES="${WHISPER_CUDA_ARCH}" \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -L/usr/local/cuda/lib64/stubs" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -L/usr/local/cuda/lib64/stubs" \
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+        -DCMAKE_INSTALL_RPATH=/usr/local/lib \
+    && cmake --build build --config Release --target whisper-cli -j$(nproc) \
+    && cp build/bin/whisper-cli /usr/local/bin/whisper-cli \
+    && find build -name 'lib*.so*' -exec cp {} /usr/local/lib/ \; \
+    && ldconfig
+
+COPY app /app/app
+COPY alembic /app/alembic
+COPY alembic.ini /app/alembic.ini
+COPY pyproject.toml .
+
+# Install CUDA-enabled torch wheel BEFORE installing the project, so
+# resemblyzer's torch dep doesn't pull the CPU wheel.
+#
+# pywhispercpp ships CPU-only wheels on PyPI. Force a source build with
+# GGML_CUDA=1 so it links against the system CUDA libs and runs whisper.cpp
+# inference on the GPU. Pinned version matches pyproject.toml.
+#
+# LD_LIBRARY_PATH points at the CUDA stubs dir so pywhispercpp's wheel-repair
+# step (auditwheel-style) can resolve libcuda.so.1. The real driver lib is
+# only present at runtime via nvidia-container-toolkit; the stub at
+# /usr/local/cuda/lib64/stubs/libcuda.so.1 (symlinked above) is sufficient
+# for the build-time bundling.
+#
+# CMAKE_CUDA_ARCHITECTURES forces the compute capability instead of nvcc's
+# `-arch=native`, which fails inside a Docker build (no GPU visible).
+#
+# GGML_NATIVE=0 disables ggml's `-march=native`, which otherwise bakes the CI
+# build runner's CPU features into the binary. A runner with AVX-512 produced a
+# pywhispercpp that SIGILL'd at model load on the prod Ryzen 5950X (no AVX-512).
+# With native off, ggml targets a portable x86-64 baseline that runs on any host.
+# pywhispercpp's setup.py turns every env var into a -D<KEY>=<VALUE> cmake arg,
+# so bare GGML_NATIVE=0 becomes -DGGML_NATIVE=0 (same path as GGML_CUDA=1).
+#
+# CMAKE_{EXE,SHARED}_LINKER_FLAGS point ggml's build at the libcuda *stub*.
+# This is REQUIRED, not optional: newer ggml (the version pywhispercpp 1.4.1
+# vendors, whisper.cpp 1.8.4) runs a CUDA compiler link-check at configure time.
+# No real driver exists at image-build time — only the stub — so without the
+# stub on the linker path that check fails to link libcuda and ggml *silently
+# disables CUDA*, producing a CPU-only wheel (the 2026-07 prod ~10s-STT outage).
+# The standalone whisper-cli build above already passes these same flags for the
+# same reason; the pywhispercpp build needs them too. setup.py forwards each env
+# var as one argv element, so the embedded space in the value is preserved.
+# PYWHISPERCPP_VERSION is derived from pyproject.toml, NOT hardcoded. This is
+# load-bearing: `pip install .` below installs the app, whose pyproject pins an
+# exact pywhispercpp. If the source build here used a DIFFERENT version, that
+# second install would satisfy the app's pin by pulling the CPU-only PyPI wheel
+# and *clobber* this CUDA source build — silent CPU STT (the 2026-07 outage:
+# Dockerfile built 1.4.1, pyproject pinned 1.5.0). Deriving the version keeps
+# them in lockstep so the source build survives the app install.
+# torch/torchaudio are PINNED (not floating), and PyPI is kept as an extra index.
+# The cu124 index periodically prunes older transitive nvidia-* wheels; with a bare
+# --index-url (PyPI excluded) an UNPINNED torch resolves to a version whose
+# nvidia-cudnn-cu12 pin is no longer served there -> ResolutionImpossible (CI break
+# 2026-08-14). Pin to the last-known-good cu124 build and let --extra-index-url pull
+# transitive nvidia wheels from PyPI. `==2.6.0` still matches the `2.6.0+cu124` local
+# wheel (and outranks the plain PyPI `2.6.0`, so no CPU wheel sneaks in).
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir \
+       --index-url https://download.pytorch.org/whl/cu124 \
+       --extra-index-url https://pypi.org/simple \
+       torch==2.6.0 torchaudio==2.6.0 \
+    && PYWHISPERCPP_VERSION="$(sed -n 's/.*pywhispercpp==\([0-9][0-9.]*\).*/\1/p' pyproject.toml | head -1)" \
+    && test -n "$PYWHISPERCPP_VERSION" || { echo "FATAL: could not read pywhispercpp==<ver> from pyproject.toml"; exit 1; } \
+    && echo "Source-building pywhispercpp==${PYWHISPERCPP_VERSION} with CUDA (matches pyproject.toml)" \
+    && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH} \
+       CUDACXX=/usr/local/cuda/bin/nvcc \
+       CMAKE_CUDA_ARCHITECTURES=${WHISPER_CUDA_ARCH} \
+       CMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -L/usr/local/cuda/lib64/stubs" \
+       CMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -L/usr/local/cuda/lib64/stubs" \
+       GGML_CUDA=1 GGML_NATIVE=0 pip install --no-cache-dir --no-binary pywhispercpp "pywhispercpp==${PYWHISPERCPP_VERSION}" \
+    && pip install --no-cache-dir .
+
+# GUARD: fail the build if the installed pywhispercpp has NO CUDA backend.
+#
+# The GPU-vs-CPU decision is baked in at build time; a CPU-only pywhispercpp
+# shipped to prod once and ran STT on CPU at ~10s/utterance because nothing
+# checked (2026-07 outage). Two independent failure modes this catches:
+#   1. ggml silently disables CUDA at configure time (missing stub linker flags).
+#   2. `pip install .` clobbers the CUDA source build with a CPU PyPI wheel
+#      (pywhispercpp version mismatch between this Dockerfile and pyproject.toml).
+# libggml-cuda is present iff CUDA was compiled in AND survived to the final
+# install. Search all of site-packages: depending on the pywhispercpp version it
+# lands either in pywhispercpp.libs/ (auditwheel-vendored) or at the site-packages
+# root (1.5.0+). No GPU is needed to check for the artifact, so this is CI-safe.
+RUN SITE=/usr/local/lib/python3.11/dist-packages; \
+    HIT="$(find "$SITE" -maxdepth 2 -name 'libggml-cuda*.so*' 2>/dev/null | head -1)"; \
+    if [ -n "$HIT" ]; then \
+      echo "OK: pywhispercpp CUDA backend present -> $HIT"; \
+    else \
+      echo "FATAL: installed pywhispercpp has NO CUDA backend (no libggml-cuda under $SITE)."; \
+      echo "Either ggml disabled CUDA at build, or the app install pulled a CPU-only"; \
+      echo "pywhispercpp wheel over the source build (version mismatch vs pyproject.toml)."; \
+      echo "This would silently run STT on CPU (~10s/utterance). Failing the build."; \
+      echo "libggml* under site-packages:"; find "$SITE" -maxdepth 2 -name 'libggml*' 2>/dev/null || true; \
+      exit 1; \
+    fi
+
+# pywhispercpp's wheel-repair step bundles a hash-renamed copy of the
+# CUDA driver stub (libcuda-<hash>.so) inside the wheel. The renamed
+# stub exports cuDeviceGet et al. but isn't a real driver, so any actual
+# CUDA call fails at runtime ("cuDeviceGet(&device, id)" → CUDA error).
+# Replace it with a dangling symlink to the real driver lib that
+# nvidia-container-toolkit injects at /usr/lib/x86_64-linux-gnu/libcuda.so.1
+# at container start. The link resolves at load-time, so libggml-cuda
+# picks up the real driver via its bundled NEEDED entry.
+RUN set -e; \
+    found=0; \
+    for f in /usr/local/lib/python3.11/dist-packages/pywhispercpp.libs/libcuda-*.so; do \
+      [ -e "$f" ] || continue; \
+      ln -sf /usr/lib/x86_64-linux-gnu/libcuda.so.1 "$f"; \
+      echo "relinked bundled CUDA driver stub -> real libcuda.so.1: $f"; \
+      found=1; \
+    done; \
+    [ "$found" = 1 ] || echo "WARN: no bundled libcuda-<hash>.so to relink (glob unmatched); libggml-cuda will resolve libcuda from the system path at runtime."
+
+ENV PORT=7706 \
+    WHISPER_MODEL=/root/whisper.cpp/models/ggml-base.en.bin \
+    WHISPER_CLI=/usr/local/bin/whisper-cli \
+    JARVIS_VOICE_DEVICE=cuda
+
+EXPOSE 7706
+
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT}

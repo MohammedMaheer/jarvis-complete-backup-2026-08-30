@@ -1,0 +1,53 @@
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+admin.json
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+
+# Downloaded AI models and machine-local runtimes
+compose/.models/
+compose/whisper-models/
+*.gguf
+bin/
+
+# Runtime state and personal data
+backups/
+logs/
+tmp/
+voice-samples/
+%SystemDrive%/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Dependencies, caches, and generated output
+**/node_modules/
+**/.next/
+**/dist/
+**/desktop-dist/
+**/build/
+**/coverage/
+**/.cache/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.venv/
+**/venv/
+**/.dart_tool/
+**/.gradle/
+*.pyc
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+

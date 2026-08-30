@@ -1,0 +1,73 @@
+{
+  "name": "jarvis-admin",
+  "productName": "JARVIS Neural Interface",
+  "description": "Mohammed Maheer's private local neural desktop assistant",
+  "author": "Mohammed Maheer",
+  "private": true,
+  "version": "0.0.0",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "main": "desktop/main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "desktop": "electron .",
+    "desktop:pack": "electron-builder --win portable"
+  },
+  "build": {
+    "appId": "dev.jarvis.maheer.desktop",
+    "productName": "JARVIS Neural Interface",
+    "directories": {
+      "output": "desktop-dist"
+    },
+    "files": [
+      "desktop/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "desktop/*.ps1"
+    ],
+    "win": {
+      "target": "portable",
+      "icon": "desktop/jarvis-icon.png",
+      "artifactName": "JARVIS-Neural-Interface-${version}.${ext}"
+    }
+  },
+  "dependencies": {
+    "@react-three/drei": "^10.7.8",
+    "@react-three/fiber": "^9.7.0",
+    "@tanstack/react-query": "^5.101.4",
+    "axios": "^1.19.0",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.31.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "react-router-dom": "^7.18.2",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "sonner": "^2.0.8",
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.3.3",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "electron": "^44.0.0",
+    "electron-builder": "^26.15.3",
+    "eslint": "^10.8.1",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.4",
+    "globals": "^17.11.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.67.0",
+    "vite": "^8.2.1"
+  }
+}

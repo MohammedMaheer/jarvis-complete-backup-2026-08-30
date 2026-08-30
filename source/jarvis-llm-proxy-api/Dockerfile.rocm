@@ -1,0 +1,144 @@
+# ============================================================================
+# Jarvis LLM Proxy API - Dockerfile.rocm (AMD GPU via ROCm/hipBLAS)
+# ============================================================================
+# For AMD GPUs (RDNA2 through RDNA4) using ROCm. Better prompt processing and
+# multi-GPU than Vulkan, but larger image and more complex setup.
+# ROCm 7.2 base — required for RDNA4 / gfx1201 (RX 9070/9070 XT); 6.3 predates it.
+# Requires --device /dev/dri --device /dev/kfd passthrough in docker-compose.
+#
+# Build:  docker build -f Dockerfile.rocm -t jarvis-llm-proxy-api:rocm .
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Builder
+# ---------------------------------------------------------------------------
+# Pinned by digest (see Dockerfile for rationale). Refresh deliberately:
+#   docker buildx imagetools inspect rocm/dev-ubuntu-22.04:7.2.4
+FROM rocm/dev-ubuntu-22.04:7.2.4@sha256:a50a8547101ac9e7c35848ff609a56335214b789b468c9eb05dcd006a4a38c25 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    python3-pip \
+    cmake \
+    build-essential \
+    hipblas-dev \
+    rocblas-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+WORKDIR /build
+
+# Base requirements (no vLLM — ROCm vLLM needs separate handling)
+COPY requirements-base.txt .
+RUN pip install --no-cache-dir -r requirements-base.txt
+
+# GPU archs to compile HIP kernels for — the officially-supported ROCm 7.2 set
+# (CDNA MI50/MI100/MI200 + RDNA2 gfx1030 + RDNA3 gfx110x + RDNA4 gfx120x). Each
+# arch adds real build time, so this list is deliberately focused. RDNA2/3
+# consumer cards OUTSIDE it (e.g. gfx1031/gfx1032 RX 6600/6700, gfx1103 APUs)
+# run by masquerading as the nearest arch at runtime via HSA_OVERRIDE_GFX_VERSION
+# (10.3.0 RDNA2 / 11.0.0 RDNA3) — NOTE: HSA_OVERRIDE does NOT work for RDNA4, its
+# ISA must be compiled natively (gfx1201 = RX 9070/9070 XT, gfx1200 = RX 9060).
+# For a fast, single-card build override this: --build-arg GPU_TARGETS=gfx1201
+ARG GPU_TARGETS="gfx906;gfx908;gfx90a;gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+
+# Build llama-cpp-python with the ROCm/HIP backend.
+# IMPORTANT: the CMake option is GGML_HIP. The old name GGML_HIPBLAS was removed
+# upstream (llama.cpp #10238) and is SILENTLY IGNORED by CMake — it produces a
+# CPU-only build with no error. HIPCXX/HIP_PATH point CMake at the ROCm compiler.
+# GGML_CUDA_FORCE_MMQ=ON: RDNA4/gfx1201 has no working hipBLASLt/rocBLAS Tensile
+# GEMM kernels in stable ROCm 7.2.x — the FP16 cuBLAS path faults inside
+# libamdhip64 on the first prompt matmul. Forcing MMQ makes llama.cpp use its OWN
+# quantized matmul kernels (compiled for gfx1201) and never call the broken vendor
+# GEMM for quantized weights. (Compile-time macro in llama-cpp-python 0.3.16 — it
+# is NOT a runtime env var, so it must be baked in here.)
+ENV CMAKE_ARGS="-DGGML_HIP=ON -DGPU_TARGETS=${GPU_TARGETS} -DGGML_CUDA_FORCE_MMQ=ON"
+RUN HIPCXX=/opt/rocm/llvm/bin/clang HIP_PATH=/opt/rocm \
+    pip install --no-cache-dir "llama-cpp-python==0.3.16" --no-binary llama-cpp-python
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime
+# ---------------------------------------------------------------------------
+# Same pinned digest as the builder stage.
+FROM rocm/dev-ubuntu-22.04:7.2.4@sha256:a50a8547101ac9e7c35848ff609a56335214b789b468c9eb05dcd006a4a38c25 AS runtime
+
+# Flash attention's stock HIP kernel faults natively on RDNA4/gfx1201 (RX 9070/XT)
+# during inference and takes down the model service (uncatchable native crash).
+# Ship the ROCm image with FA OFF — it's also FASTER on RDNA4. Scoped to this
+# image only (CUDA/Metal keep FA on). Override with JARVIS_FLASH_ATTN=true.
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    LD_LIBRARY_PATH=/opt/rocm/lib \
+    JARVIS_FLASH_ATTN=false \
+    ROCBLAS_USE_HIPBLASLT=0
+
+# hipblas + rocblas are the ROCm math RUNTIME libs libllama.so links against
+# (GGML_HIP). The builder installs the -dev variants to compile; the runtime
+# needs the runtime libs (libhipblas.so / librocblas.so + its Tensile kernels) —
+# the non-complete rocm/dev base does NOT include them, so without this the image
+# fails to load with "libhipblas.so.N: cannot open shared object file".
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    libgomp1 \
+    curl \
+    hipblas \
+    rocblas \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+
+COPY --from=builder /usr/local/lib/python3.11/dist-packages /usr/local/lib/python3.11/dist-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+WORKDIR /app
+
+COPY api/ ./api/
+COPY auth/ ./auth/
+COPY backends/ ./backends/
+COPY cache/ ./cache/
+COPY config/ ./config/
+COPY db/ ./db/
+COPY managers/ ./managers/
+COPY models/ ./models/
+COPY queues/ ./queues/
+COPY scripts/ ./scripts/
+COPY services/ ./services/
+COPY storage/ ./storage/
+COPY alembic/ ./alembic/
+COPY alembic.ini .
+COPY main.py .
+# version.py is read by api/health_routes.py to report the running version on
+# /health. The root .py files are copied EXPLICITLY here, so a new one must be
+# added or the container dies at import: ModuleNotFoundError: No module named
+# 'version' (caught by install-e2e, 2026-07-14).
+COPY version.py .
+COPY gpu_select.py .
+COPY pyproject.toml .
+
+RUN mkdir -p /app/.models /app/logs /tmp/jarvis-adapters
+
+EXPOSE 7704 7705
+
+# Default: supervised launcher (alembic migrations, then API in foreground +
+# auto-respawning model service). Compose services typically override this
+# with their own command; serve.sh is the migration target for those compose
+# commands (it replaces the unsupervised `uvicorn model_service & exec uvicorn
+# main` pattern). serve.sh runs `alembic upgrade head` itself (RUN_MIGRATIONS
+# defaults true), so export-style compose commands that currently inline
+# `alembic upgrade head && ...` can drop their command without silently
+# losing migrations.
+CMD ["bash", "scripts/serve.sh"]

@@ -1,0 +1,57 @@
+name: Integration Trigger
+
+# Fires a repository_dispatch at jarvis-integration-tests when a PR opens or is
+# updated here. The receiver workflow (jarvis-integration-tests/.github/workflows/
+# integration-runner.yml) runs the cross-service fast lane (CASE-001..215) against
+# the PR's HEAD SHA and posts results back as a PR comment + commit status.
+#
+# T6a cutover (2026-06-22): retargeted from jarvis-node-setup -> jarvis-integration-
+# tests. The harness was migrated there (T6a) and the dispatch token re-scoped to
+# it (T9 token work); node-setup's runner is retired. For coordinated MULTI-repo
+# features, see the separate cross-repo-trigger.yml (Linked-PR: markers).
+#
+# Required secret:
+#   INTEGRATION_DISPATCH_TOKEN — fine-grained PAT scoped to
+#                                  `repository_dispatch` (write) on
+#                                  alexberardi/jarvis-integration-tests only.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+jobs:
+  dispatch:
+    # Dependabot PRs run with a SEPARATE secrets store, so the cross-repo PAT
+    # resolves to an empty string and `gh` exits 4 ("set the GH_TOKEN env
+    # variable"). The dependency bump itself is fine — the `test` job passes —
+    # so don't fail the PR on a dispatch that cannot work by design.
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Dispatch integration run
+        env:
+          GH_TOKEN: ${{ secrets.INTEGRATION_DISPATCH_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          ORIGINATING_REPO: ${{ github.repository }}
+        run: |
+          # This is the SINGLE-repo fast lane: linked_prs stays {} so the runner
+          # uses ghcr.io :dev images for the rest of the stack. Coordinated
+          # MULTI-repo features are handled by the separate cross-repo-trigger.yml,
+          # which parses `Linked-PR:` markers from the PR body and dispatches the
+          # cross-repo lane (cross-repo-services.yml) instead.
+          gh api \
+            --method POST \
+            /repos/alexberardi/jarvis-integration-tests/dispatches \
+            -f "event_type=pr-integration" \
+            -f "client_payload[service]=jarvis-command-center" \
+            -f "client_payload[pr_number]=$PR_NUMBER" \
+            -f "client_payload[head_sha]=$HEAD_SHA" \
+            -f "client_payload[head_ref]=$HEAD_REF" \
+            -f "client_payload[originating_repo]=$ORIGINATING_REPO" \
+            -f "client_payload[qa_plan_comment_id]=" \
+            -f "client_payload[linked_prs]={}"
